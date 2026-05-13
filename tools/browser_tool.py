@@ -711,6 +711,23 @@ def _run_chrome_fallback_command(
     cmd_prefix = ["npx", "agent-browser"] if browser_cmd == "npx agent-browser" else [browser_cmd]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
 
+    # In the Chrome fallback we must pass --no-sandbox because the
+    # playwright-downloaded Chromium binary can't use user namespaces on
+    # Ubuntu 23.10+ (apparmor_restrict_unprivileged_userns=1).
+    # agent-browser forwards anything after --args to the Chrome process.
+    _needs_sandbox_bypass = False
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        _needs_sandbox_bypass = True
+    else:
+        try:
+            with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") as _f:
+                if _f.read().strip() == "1":
+                    _needs_sandbox_bypass = True
+        except OSError:
+            pass
+    if _needs_sandbox_bypass:
+        base_args += ["--args", "--no-sandbox"]
+
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
     browser_env = {**os.environ, "AGENT_BROWSER_SOCKET_DIR": task_socket_dir}
@@ -1766,6 +1783,28 @@ def _run_browser_command(
         command
     ] + args
 
+    # Compute sandbox bypass flag BEFORE referencing it in cmd_parts.
+    # Must happen before the try block because _needs_sandbox_bypass is
+    # also assigned inside the try block — Python would treat it as a
+    # local variable and raise UnboundLocalError at this read site.
+    _needs_sandbox_bypass = False
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        _needs_sandbox_bypass = True
+    else:
+        _userns_restrict = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+        try:
+            with open(_userns_restrict) as _f:
+                if _f.read().strip() == "1":
+                    _needs_sandbox_bypass = True
+        except OSError:
+            pass
+
+    # If the env-var didn't set AGENT_BROWSER_CHROME_FLAGS, inject via --args
+    # so the agent-browser daemon also passes it to Chrome.
+    if _needs_sandbox_bypass and "AGENT_BROWSER_CHROME_FLAGS" not in os.environ:
+        cmd_parts.insert(-len(args) if args else len(cmd_parts), "--args")
+        cmd_parts.insert(-len(args) if args else len(cmd_parts), "--no-sandbox")
+
     try:
         # Give each task its own socket directory to prevent concurrency conflicts.
         # Without this, parallel workers fight over the same default socket path,
@@ -1802,24 +1841,9 @@ def _run_browser_command(
         # - Ubuntu 23.10+ / AppArmor systems: unprivileged user namespaces
         #   are restricted, causing Chromium to exit with "No usable sandbox"
         #   even for non-root users running under systemd or containers.
+        # NOTE: _needs_sandbox_bypass is already computed BEFORE the try block
+        # in the parent _run_browser_command scope (see lines ~1788).
         if "AGENT_BROWSER_CHROME_FLAGS" not in browser_env:
-            _needs_sandbox_bypass = False
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                _needs_sandbox_bypass = True
-                logger.debug("browser: running as root — injecting --no-sandbox")
-            else:
-                # Detect AppArmor user namespace restrictions (Ubuntu 23.10+)
-                _userns_restrict = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
-                try:
-                    with open(_userns_restrict) as _f:
-                        if _f.read().strip() == "1":
-                            _needs_sandbox_bypass = True
-                            logger.debug(
-                                "browser: AppArmor userns restrictions detected — "
-                                "injecting --no-sandbox"
-                            )
-                except OSError:
-                    pass
             if _needs_sandbox_bypass:
                 browser_env["AGENT_BROWSER_CHROME_FLAGS"] = (
                     "--no-sandbox --disable-dev-shm-usage"

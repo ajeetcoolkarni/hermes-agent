@@ -89,6 +89,8 @@ def _chrome_debug_args(port: int) -> list[str]:
         f"--user-data-dir={chrome_debug_data_dir()}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
     ]
 
 
