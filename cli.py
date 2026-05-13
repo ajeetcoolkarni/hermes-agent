@@ -303,7 +303,7 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
-            "threshold": 0.50,    # Compress at 50% of model's context limit
+            "threshold": 0.75,    # Compress at 75% of model's context limit
         },
         "agent": {
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
@@ -2047,6 +2047,11 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
     for raw in raw_values:
         for part in raw.split(","):
             normalized = part.strip()
+            # Normalize: strip any "category:" prefix.  The CLI --skills flag
+            # and skill_view() expect bare names ("kanban-worker", not
+            # "devops:kanban-worker").  A colon is never a valid skill name char.
+            if ":" in normalized:
+                normalized = normalized.split(":")[-1]
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)

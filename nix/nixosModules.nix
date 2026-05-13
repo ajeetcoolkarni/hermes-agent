@@ -260,7 +260,7 @@
           {
             model = "anthropic/claude-sonnet-4";
             terminal.backend = "local";
-            compression = { enabled = true; threshold = 0.85; };
+            compression = { enabled = true; threshold = 0.75; };
             toolsets = [ "all" ];
           }
         '';
