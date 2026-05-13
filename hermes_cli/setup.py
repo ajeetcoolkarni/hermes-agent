@@ -1770,7 +1770,7 @@ def _apply_default_agent_settings(config: dict):
     config.setdefault("display", {})["tool_progress"] = "all"
 
     config.setdefault("compression", {})["enabled"] = True
-    config["compression"]["threshold"] = 0.50
+    config["compression"]["threshold"] = 0.75
 
     config.setdefault("session_reset", {}).update({
         "mode": "both",
@@ -1782,7 +1782,7 @@ def _apply_default_agent_settings(config: dict):
     print_success("Applied recommended defaults:")
     print_info("  Max iterations: 90")
     print_info("  Tool progress: all")
-    print_info("  Compression threshold: 0.50")
+    print_info("  Compression threshold: 0.75")
     print_info("  Session reset: inactivity (1440 min) + daily (4:00)")
     print_info("  Run `hermes setup agent` later to customize.")
 
@@ -1849,7 +1849,7 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = cfg_get(config, "compression", "threshold", default=0.50)
+    current_threshold = cfg_get(config, "compression", "threshold", default=0.75)
     threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
     try:
         threshold = float(threshold_str)
@@ -1859,7 +1859,7 @@ def setup_agent_settings(config: dict):
         pass
 
     print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
+        f"Context compression threshold set to {config['compression'].get('threshold', 0.75)}"
     )
 
     # ── Session Reset Policy ──
