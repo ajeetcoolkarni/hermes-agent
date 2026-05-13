@@ -1785,6 +1785,10 @@ def _parse_tui_skills_env() -> list[str]:
     seen: set[str] = set()
     for part in raw.replace("\n", ",").split(","):
         item = part.strip()
+        # Normalize: strip any "category:" prefix.  The TUI skills env var
+        # and skill_view() both expect bare names.
+        if ":" in item:
+            item = item.split(":")[-1]
         if item and item not in seen:
             seen.add(item)
             skills.append(item)
