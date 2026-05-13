@@ -63,6 +63,37 @@ class TestForegroundTimeoutCap:
         assert "background=true" in result["error"]
         assert "nohup" in result["error"].lower()
 
+    def test_foreground_rejects_worker_vite_preview_pattern(self):
+        """The exact worker pattern `cd ... && npx vite preview ... &` must be blocked."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+
+            result = json.loads(terminal_tool(
+                command="cd /mnt/win-workspace/nebula-drift && npx vite preview --port 8080 &",
+            ))
+
+        assert result["exit_code"] == -1
+        assert "background=true" in result["error"]
+        assert "backgrounding" in result["error"].lower() or "long-lived" in result["error"].lower()
+
+    def test_background_rejects_shell_level_backgrounding(self):
+        """background=True should reject commands that also try to detach via shell syntax."""
+        from tools.terminal_tool import terminal_tool
+
+        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
+             patch("tools.terminal_tool._start_cleanup_thread"):
+
+            result = json.loads(terminal_tool(
+                command="cd /mnt/win-workspace/nebula-drift && npx vite preview --port 8080 &",
+                background=True,
+            ))
+
+        assert result["exit_code"] == -1
+        assert "background=true already launches and tracks the process" in result["error"].lower()
+        assert "remove '&'" in result["error"].lower()
+
     def test_foreground_rejects_long_lived_server_command(self):
         """Foreground dev server commands should be redirected to background mode."""
         from tools.terminal_tool import terminal_tool

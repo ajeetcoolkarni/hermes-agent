@@ -1629,6 +1629,35 @@ def _foreground_background_guidance(command: str) -> str | None:
     return None
 
 
+def _managed_background_conflict_guidance(command: str) -> str | None:
+    """Reject shell-level backgrounding when Hermes already manages the process.
+
+    ``terminal(background=True)`` is the supported way to launch a tracked
+    long-lived process. If the command itself also uses ``&`` / ``nohup`` /
+    ``disown`` / ``setsid``, Hermes only tracks the wrapper shell while the real
+    server escapes as an orphan. That defeats lifecycle tracking/cleanup and can
+    poison later process or browser steps.
+    """
+    if _looks_like_help_or_version_command(command):
+        return None
+
+    if _SHELL_LEVEL_BACKGROUND_RE.search(command):
+        return (
+            "background=true already launches and tracks the process for you. "
+            "Remove shell-level background wrappers (nohup/disown/setsid) and pass "
+            "the long-lived command directly."
+        )
+
+    if _INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command):
+        return (
+            "background=true already launches and tracks the process for you. "
+            "Remove '&' from the command and pass the server/watch command directly so Hermes "
+            "can manage its lifecycle, output, and cleanup."
+        )
+
+    return None
+
+
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -1750,6 +1779,19 @@ def terminal_tool(
                     f"notify_on_complete=true for long-running commands."
                 ),
             }, ensure_ascii=False)
+
+        # Guardrail: once Hermes is already managing the process in background
+        # mode, reject any extra shell-level backgrounding inside the command.
+        # Otherwise the real server escapes tracking and later steps can hang.
+        if background:
+            guidance = _managed_background_conflict_guidance(command)
+            if guidance:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": guidance,
+                    "status": "error",
+                }, ensure_ascii=False)
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.

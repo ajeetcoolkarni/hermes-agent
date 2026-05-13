@@ -1901,7 +1901,7 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
-"""Promote ``todo`` or ``blocked`` tasks to ``ready`` when all parents are ``done``.
+    """Promote ``todo`` or ``blocked`` tasks to ``ready`` when all parents are ``done``.
 
     A task is also kept ``blocked`` if its workspace directory is currently
     occupied by a ``running`` or ``blocked`` task (serialised per-project).
@@ -1928,7 +1928,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-if not all(p["status"] == "done" for p in parents):
+            if not all(p["status"] == "done" for p in parents):
                 continue
             # --- workspace collision check ---
             ws_key = _normalize_workspace(row["workspace_path"])
