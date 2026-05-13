@@ -124,6 +124,10 @@ hermes chat -q "Hello"
 # Preferred — matches CI (hermetic env, 4 xdist workers); see AGENTS.md
 scripts/run_tests.sh
 
+# Preferred for a quick targeted run: forces the repo venv instead of
+# accidentally using system python.
+scripts/pytest_target.sh tests/agent/test_auxiliary_client.py::TestAuxiliaryPoolAwareness::test_async_call_llm_retries_nous_after_401
+
 # Alternative (activate the venv first). The wrapper is still recommended
 # for parity with GitHub Actions before you open a PR:
 pytest tests/ -v
