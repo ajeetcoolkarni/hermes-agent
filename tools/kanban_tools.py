@@ -625,12 +625,66 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    # Normalize: strip any "category:" prefix. The CLI --skills flag and
+    # skill_view() expect bare names (e.g. "kanban-worker", not
+    # "devops:kanban-worker"). A colon is never a valid skill name char.
+    if skills is not None:
+        skills = [
+            s.split(":")[-1] if ":" in str(s) else str(s)
+            for s in skills
+            if s
+        ]
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+
+    # --- Runtime guard: workspace collision detection ---
+    # For 'dir' or 'worktree' workspaces, if there is already an active task on
+    # the same workspace, the new task MUST have that existing task as a parent.
+    # This enforces sequential pipeline flow (asset-builder -> worker -> reviewer)
+    # and prevents file races on shared directories regardless of profile.
+    if workspace_kind in ("dir", "worktree") and workspace_path:
+        try:
+            kb, conn = _connect()
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT id, title, status, assignee FROM tasks
+                    WHERE workspace_kind = ?
+                      AND workspace_path = ?
+                      AND (status IN ('todo','running','ready','blocked'))
+                      AND id != ?
+                    """,
+                    (str(workspace_kind), str(workspace_path),
+                     os.environ.get("HERMES_KANBAN_TASK", "")),
+                )
+                existing = cur.fetchall()
+                if existing:
+                    existing_ids = {r[0] for r in existing}
+                    parent_set = set(parents) if parents else set()
+                    # Allow if at least one existing task is a parent of this new task
+                    if not existing_ids & parent_set:
+                        existing_list = ", ".join([f"{r[0]}({r[2]}/{r[3]})" for r in existing])
+                        return tool_error(
+                            f"PIPELINE GUARD — BLOCKED: You are creating a task targeting workspace "
+                            f"'{workspace_path}' with assignee='{assignee}'. There are already active tasks "
+                            f"({existing_list}) on the SAME workspace. To enforce proper sequential flow "
+                            f"(e.g. asset-builder -> worker -> reviewer), you MUST chain this new task by "
+                            f"setting parents=[existing_task_id] so it waits for prior work to finish. "
+                            f"If you truly intend parallel access, ensure tasks are read-only OR use "
+                            f"different workspaces. Never run multiple write tasks on the same directory "
+                            f"without explicit parent-child ordering — this causes git/npm/build races and "
+                            f"corrupts the workspace."
+                        )
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("kanban_create pipeline guard failed (non-fatal)")
+    # --- End runtime guard ---
+
     try:
         kb, conn = _connect()
         try:
@@ -971,7 +1025,17 @@ KANBAN_CREATE_SCHEMA = {
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles.\n\n"
+        "**CRITICAL — Same-profile same-workspace collision warning:**\n"
+        "The dispatcher claims tasks by profile, not by file lock. If two tasks "
+        "share the same ``workspace_path`` AND the same ``assignee`` (profile) and "
+        "are siblings (no parent dependency), they WILL spawn simultaneously and "
+        "race each other's file writes / npm install / build output, corrupting the workspace.\n\n"
+        "Before creating, verify your graph:\n"
+        "- If two tasks have the same assignee AND same workspace_path, they MUST NOT be siblings.\n"
+        "- Chain them with ``parents=[previous_task_id]`` so the dispatcher runs them sequentially.\n"
+        "- Only parallel siblings when: different assignees OR different workspaces (or read-only shared access).\n"
+        "If you violate this, the tool may reject the call."
     ),
     "parameters": {
         "type": "object",
@@ -1068,7 +1132,11 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Skill names to force-load into the dispatched "
                     "worker (in addition to the built-in kanban-worker "
-                    "skill). Use this to pin a task to a specialist "
+                    "skill). Use bare names only — do NOT prefix with "
+                    "a category (e.g. use 'kanban-orchestrator', NOT "
+                    "'devops:kanban-orchestrator'). The system strips "
+                    "category prefixes automatically, but using the bare "
+                    "form is safer. Use this to pin a task to a specialist "
                     "context — e.g. ['translation'] for a translation "
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "

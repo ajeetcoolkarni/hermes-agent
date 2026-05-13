@@ -282,7 +282,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
-                               "(repeatable). Appended to the built-in "
+                               "(repeatable). Bare names only — do NOT use "
+                               "category:skill format. The system normalizes "
+                               "'devops:kanban-worker' to 'kanban-worker' "
+                               "automatically, but prefer the bare form in task "
+                               "creation. Appended to the built-in "
                                "kanban-worker skill. Example: "
                                "--skill translation --skill github-code-review")
     p_create.add_argument("--max-retries", type=int, default=None,

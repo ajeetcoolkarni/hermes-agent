@@ -99,7 +99,7 @@ _IS_WINDOWS = sys.platform == "win32"
 # dispatcher tick reclaims it.  Workers that outlive this window should call
 # ``heartbeat_claim(task_id)`` periodically.  In practice most kanban
 # workloads either finish within 15m or set a longer claim explicitly.
-DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_CLAIM_TTL_SECONDS = 300 * 60
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -112,6 +112,66 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+
+
+# ---------------------------------------------------------------------------
+# Workspace collision guard helpers
+# ---------------------------------------------------------------------------
+
+# Profiles that run on the same local GPU pool should NOT have a DB-level
+# concurrency cap — they are physically limited by the single llama-server.
+# All *other* profiles (fallback / remote) are capped at MAX_CONCURRENT_FALLBACK.
+_LOCAL_PROFILES          = {"planner", "worker"}
+_MAX_CONCURRENT_FALLBACK = 2
+
+_NORMALIZE_WS_RE = re.compile(r"[\\/:]+")
+
+
+def _normalize_workspace(path):
+    """Return a canonical workspace key for DB comparison.
+
+    Any folder under ``win-workspace/`` (or ``h-workspace/``) is the project
+    root.  All separators are normalised to ``/`` and collapsed so
+        ``/mnt/win-workspace/trade_agent_pro/src/assets.ts`` and
+        ``C:\\\\Users\\\\Ajeet\\\\h-workspace\\\\trade_agent_pro``
+    both hash-collide to ``trade_agent_pro``.
+
+    For non-Windows paths the *entire* normalised path is returned so
+    only identical directories collide (e.g. two tasks both pointing at
+    ``/home/ajeet/workspace/nebula-drift``).
+    """
+    if not path:
+        return None
+    # Normalise backslashes -> forward slashes, collapse runs.
+    normed = _NORMALIZE_WS_RE.sub("/", path).lower().strip("/")
+    # Strip any prefix up to and including ``win-workspace/`` or ``h-workspace/``.
+    for marker in ("win-workspace/", "h-workspace/"):
+        if marker in normed:
+            after = normed.split(marker, 1)[1]
+            return after.split("/")[0] if after else None
+    # Edge case: the path IS the workspace root itself.
+    if normed.endswith("win-workspace") or normed.endswith("h-workspace"):
+        return None
+    # Everything else (Linux project dirs, scratch dirs, etc.)  Treat the
+    # full normalised path as the lock key so ``/home/...`` paths don't
+    # all falsely collide under "home".
+    return normed
+
+
+def _workspace_busy_rows(conn: sqlite3.Connection) -> list:
+    """Return all ``(id, workspace_path, assignee)`` rows that are
+    ``running`` and therefore hold an active workspace lock."""
+    return conn.execute(
+        "SELECT id, workspace_path, assignee FROM tasks WHERE status = 'running'"
+    ).fetchall()
+
+
+def _assignee_running_count(conn, assignee):
+    row = conn.execute(
+        "SELECT COUNT(1) FROM tasks WHERE assignee = ? AND status = 'running'",
+        (assignee,),
+    ).fetchone()
+    return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1331,15 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    if assignee is not None:
+        from hermes_cli.profiles import get_profile_dir, _get_profiles_root
+        if not get_profile_dir(assignee).is_dir():
+            available = sorted(p.name for p in _get_profiles_root().iterdir() if p.is_dir())
+            raise ValueError(
+                f"Cannot create task: profile '{assignee}' does not exist. "
+                f"Available profiles: {', '.join(available) or '[none]'}. "
+                f"Create the profile first with 'hermes profile create {assignee}' or assign to an existing profile."
+            )
     if not title or not title.strip():
         raise ValueError("title is required")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
@@ -1309,7 +1378,12 @@ def create_task(
             if name.casefold() in KNOWN_TOOLSET_NAMES:
                 toolset_typos.append(name)
                 continue
-            if name in seen:
+            # Normalize: strip any "category:" prefix.  The dispatcher and
+            # skill_view() both expect bare names (e.g. "kanban-worker",
+            # not "devops:kanban-worker").
+            if ":" in name:
+                name = name.split(":")[-1]
+            if not name or name in seen:
                 continue
             seen.add(name)
             cleaned.append(name)
@@ -1357,14 +1431,14 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
+                        # If any parent is not yet done, we're blocked.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
-                            initial_status = "todo"
+                            initial_status = "blocked"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -1827,31 +1901,70 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+"""Promote ``todo`` or ``blocked`` tasks to ``ready`` when all parents are ``done``.
+
+    A task is also kept ``blocked`` if its workspace directory is currently
+    occupied by a ``running`` or ``blocked`` task (serialised per-project).
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
     """
     promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id FROM tasks WHERE status = 'todo'"
+        busy = {
+            _normalize_workspace(r["workspace_path"])
+            for r in _workspace_busy_rows(conn)
+        }
+        waiting_rows = conn.execute(
+            "SELECT id, workspace_path, assignee, status FROM tasks "
+            "WHERE status IN ('todo', 'blocked')"
         ).fetchall()
-        for row in todo_rows:
+        for row in waiting_rows:
             task_id = row["id"]
+            # --- parent done check ---
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in {"done", "archived"} for p in parents):
-                conn.execute(
-                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                    (task_id,),
-                )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
+if not all(p["status"] == "done" for p in parents):
+                continue
+            # --- workspace collision check ---
+            ws_key = _normalize_workspace(row["workspace_path"])
+            if ws_key and ws_key in busy:
+                # leave blocked (or re-block a task that somehow advanced to todo while busy)
+                if row["status"] != "blocked":
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status = 'todo'",
+                        (task_id,),
+                    )
+                    _append_event(conn, task_id, "blocked", f"workspace busy: {ws_key}")
+                continue
+            # --- assignee cap check ---
+            assignee = row["assignee"]
+            if assignee and assignee not in _LOCAL_PROFILES:
+                running_cnt = _assignee_running_count(conn, assignee)
+                if running_cnt >= _MAX_CONCURRENT_FALLBACK:
+                    if row["status"] != "blocked":
+                        conn.execute(
+                            "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status = 'todo'",
+                            (task_id,),
+                        )
+                        _append_event(conn, task_id, "blocked",
+                                      f"cap {assignee}: {running_cnt}/{_MAX_CONCURRENT_FALLBACK}")
+                    continue
+            # ready to promote
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status IN ('todo', 'blocked')",
+                (task_id,),
+            )
+            _append_event(conn, task_id, "promoted", None)
+            promoted += 1
+            # Lock the workspace for the rest of this pass so only one task
+            # per workspace becomes ready per tick.
+            if ws_key:
+                busy.add(ws_key)
     return promoted
 
 
@@ -3121,6 +3234,10 @@ class DispatchResult:
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
+    skipped_workspace_busy: list[str] = field(default_factory=list)
+    """Ready task ids skipped because workspace directory is already occupied."""
+    skipped_cap: list[str] = field(default_factory=list)
+    """Ready task ids skipped because assignee is at max concurrent fallback cap."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -3863,9 +3980,14 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "SELECT DISTINCT assignee FROM tasks t "
+        "WHERE t.status = 'ready' AND t.assignee IS NOT NULL "
+        "    AND t.claim_lock IS NULL "
+        "    AND NOT EXISTS ("
+        "        SELECT 1 FROM task_links l "
+        "        JOIN tasks p ON p.id = l.parent_id "
+        "        WHERE l.child_id = t.id AND p.status != 'done'"
+        "    )"
     ).fetchall()
     if not rows:
         return False
@@ -3964,26 +4086,25 @@ def dispatch_once(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn)
 
-    # Count tasks already running so max_spawn enforces concurrency rather
-    # than a per-tick spawn budget. See the docstring above for the full
-    # rationale; the short version is that a 60-second tick interval with a
-    # per-tick budget of N would grow concurrency by N every tick on a busy
-    # board, since "running" tasks aren't reclaimed by completion alone —
-    # they sit in status='running' until the worker calls
-    # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
-    running_count = 0
-    if max_spawn is not None:
-        running_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
-
+# --- workspace lock: any row running/blocked on same project dir prevents spawn ---
+    busy_ws = {
+        _normalize_workspace(r["workspace_path"])
+        for r in _workspace_busy_rows(conn)
+    }
+    # --- assignee cap snapshot (non-local profiles only) ---
+    _running_by_assignee = {}
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "SELECT id, assignee, workspace_path FROM tasks t "
+        "WHERE t.status = 'ready' AND t.claim_lock IS NULL "
+        "    AND NOT EXISTS ("
+        "        SELECT 1 FROM task_links l "
+        "        JOIN tasks p ON p.id = l.parent_id "
+        "        WHERE l.child_id = t.id AND p.status != 'done'"
+        "    )"
+        "ORDER BY t.priority DESC, t.created_at ASC"
     ).fetchall()
+    _skipped_ws = []
+    _skipped_cap = []
     spawned = 0
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
@@ -3991,6 +4112,22 @@ def dispatch_once(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        # --- workspace guard: skip if same project already occupied ---
+        ws_key = _normalize_workspace(row["workspace_path"])
+        if ws_key and ws_key in busy_ws:
+            _skipped_ws.append(row["id"])
+            continue
+        # --- cap guard: non-local profiles max 2 concurrent ---
+        _assignee = row["assignee"]
+        if _assignee not in _LOCAL_PROFILES:
+            _cnt = _running_by_assignee.setdefault(
+                _assignee,
+                _assignee_running_count(conn, _assignee),
+            )
+            if _cnt >= _MAX_CONCURRENT_FALLBACK:
+                _skipped_cap.append(row["id"])
+                continue
+            _running_by_assignee[_assignee] = _cnt + 1
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -4032,6 +4169,11 @@ def dispatch_once(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        # Lock the workspace for the rest of this tick so later candidates
+        # do not race into the same project directory (intra-tick guard).
+        _ws_key = _normalize_workspace(str(workspace))
+        if _ws_key:
+            busy_ws.add(_ws_key)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -4064,6 +4206,9 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+    # --- telemetry: why we skipped ---
+    result.skipped_workspace_busy = _skipped_ws
+    result.skipped_cap = _skipped_cap
     return result
 
 
@@ -4149,63 +4294,43 @@ def _rotate_worker_log(
         pass
 
 
-def _resolve_hermes_argv() -> list[str]:
-    """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
+# ---------------------------------------------------------------------------
+# Prior-run context injection (respawn memory)
+# ---------------------------------------------------------------------------
 
-    Tries in order:
+def _inject_prior_run_context(task, board=None):
+    """Inject prior-run summary into the task body before respawn.
 
-    1. ``shutil.which("hermes")`` — the console-script shim, the same form
-       that shows up in ``ps`` output and existing logs. Preferred so live
-       systems' diagnostics stay familiar.
-    2. ``sys.executable -m hermes_cli.main`` — fallback for setups where
-       Hermes is launched from a venv and the ``hermes`` shim is not on
-       the dispatcher's ``$PATH`` (cron, systemd ``User=`` services,
-       launchd jobs, detached processes, etc.). Goes through the running
-       interpreter so the result is independent of ``$PATH``.
-
-    Mirrors ``gateway.run._resolve_hermes_bin`` for the same reason. Kept
-    local (not imported from gateway) because ``hermes_cli`` sits below
-    ``gateway`` in the dependency order.
+    Scans the DB for the most recent non-done run, reads its log, generates
+    a context block, and prepends it to the task body. This prevents the
+    new worker from starting from scratch when the prior run had already
+    completed substantial work.
     """
-    import shutil
-
-    hermes_bin = shutil.which("hermes")
-    if hermes_bin:
-        return [hermes_bin]
-    # Fallback to the module form. ``hermes_cli.main`` is the actual
-    # console-script target declared in pyproject.toml, NOT a top-level
-    # ``hermes`` package — there is no ``hermes`` package to import.
-    return [sys.executable, "-m", "hermes_cli.main"]
-
-
-def _worker_terminal_timeout_env(
-    max_runtime_seconds: Optional[int],
-    current_timeout: Optional[str],
-) -> Optional[str]:
-    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
-
-    Kanban's ``max_runtime_seconds`` bounds the whole worker attempt. The
-    terminal tool has its own default timeout via ``TERMINAL_TIMEOUT``; when
-    the worker runtime is longer, raise only the child process default so a
-    long command is not killed by the generic terminal default first.
-    """
-    if max_runtime_seconds is None:
-        return None
     try:
-        runtime = int(max_runtime_seconds)
-    except (TypeError, ValueError):
-        return None
-    if runtime <= 0:
-        return None
-
-    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
-    try:
-        existing = int(str(current_timeout).strip()) if current_timeout else 0
-    except (TypeError, ValueError):
-        existing = 0
-    if existing >= desired:
-        return None
-    return str(desired)
+        script = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / \
+                 "skills" / "devops" / "kanban-worker" / "scripts" / "kanban_prior_run_injector.py"
+        if not script.exists():
+            return
+        import subprocess, json
+        result = subprocess.run(
+            ["python3", str(script), "--task-id", task.id, "--board", board or "default"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return
+        data = json.loads(result.stdout)
+        if data.get("ok"):
+            # Update the in-memory task object so the worker reads the new body
+            conn = sqlite3.connect(str(kanban_db_path(board=board)))
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT body FROM tasks WHERE id = ?", (task.id,)
+            ).fetchone()
+            if row:
+                task.body = row["body"]
+            conn.close()
+    except Exception:
+        pass
 
 
 def _default_spawn(
@@ -4235,6 +4360,12 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
+    # --- Prior-run context injection (auto-injected on respawn) ---
+    # If this task has a prior crashed/killed/protocol_violation run,
+    # scan the log and inject a context block into the task body so
+    # the new worker does not start from scratch.
+    _inject_prior_run_context(task, board=board)
+    # ---------------------------------------------------------------
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -4316,8 +4447,14 @@ def _default_spawn(
     # if a task author asks for it explicitly.
     if task.skills:
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
+            # Normalize: strip any "category:" prefix that may have been stored
+            # in the DB.  The CLI --skills flag and skill_view() both expect
+            # bare names (e.g. "kanban-worker", not "devops:kanban-worker").
+            if not sk:
+                continue
+            normalized = sk.split(":")[-1] if ":" in str(sk) else str(sk)
+            if normalized != "kanban-worker":
+                cmd.extend(["--skills", normalized])
     cmd.extend([
         "chat",
         "-q", prompt,
