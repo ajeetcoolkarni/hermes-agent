@@ -1115,6 +1115,27 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         return messages
 
+    def _count_preserved_head_messages(self, messages: List[Dict[str, Any]]) -> int:
+        """Return how many leading transcript messages should stay verbatim.
+
+        Historical compaction behavior preserved the first ``protect_first_n``
+        transcript messages regardless of role. After out-of-band handoff
+        landed, that became dangerous: the child continuation session could
+        still contain the parent session's original opening user request as a
+        live transcript turn, and short follow-ups like "sure go ahead" would
+        bind to that stale opener instead of the latest task.
+
+        Root-cause fix: only preserve a leading block of explicit ``system``
+        messages. Ordinary user / assistant turns belong in the historical
+        handoff once a session compacts; they should not survive as live chat in
+        the continuation transcript.
+        """
+        preserved = 0
+        limit = min(self.protect_first_n, len(messages))
+        while preserved < limit and messages[preserved].get("role") == "system":
+            preserved += 1
+        return preserved
+
     def _align_boundary_forward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Push a compress-start boundary forward past any orphan tool results.
 
@@ -1284,7 +1305,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         skip the LLM call when the transcript is still entirely inside
         the protected head/tail.
         """
-        compress_start = self._align_boundary_forward(messages, self.protect_first_n)
+        compress_start = self._count_preserved_head_messages(messages)
+        compress_start = self._align_boundary_forward(messages, compress_start)
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         return compress_start < compress_end
 
@@ -1319,8 +1341,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         n_messages = len(messages)
-        # Only need head + 3 tail messages minimum (token budget decides the real tail size)
-        _min_for_compress = self.protect_first_n + 3 + 1
+        preserved_head = self._count_preserved_head_messages(messages)
+        # Need at least one middle message plus the minimum protected tail.
+        _min_for_compress = preserved_head + 3 + 1
         if n_messages <= _min_for_compress:
             if not self.quiet_mode:
                 logger.warning(
@@ -1340,7 +1363,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
 
         # Phase 2: Determine boundaries
-        compress_start = self.protect_first_n
+        compress_start = self._count_preserved_head_messages(messages)
         compress_start = self._align_boundary_forward(messages, compress_start)
 
         # Use token-budget tail protection instead of fixed message count

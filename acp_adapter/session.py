@@ -466,6 +466,12 @@ class SessionManager:
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 
+            pending_handoff = getattr(state.agent, "_pending_compaction_handoff", None)
+            if not pending_handoff:
+                compressor = getattr(state.agent, "context_compressor", None)
+                pending_handoff = getattr(compressor, "_compaction_handoff_state", None)
+            db.set_compaction_handoff(state.session_id, pending_handoff)
+
             # Replace stored messages with current history atomically so a
             # mid-rewrite failure rolls back and the previously persisted
             # conversation is preserved (salvaged from #13675).

@@ -45,9 +45,15 @@ def test_compress_stores_generated_summary_in_compaction_handoff_state():
     compressor = _compressor()
 
     with patch("agent.context_compressor.call_llm", return_value=_response("fresh summary body")):
-        compressor.compress(_messages_for_compress())
+        compressed = compressor.compress(_messages_for_compress())
 
     assert compressor._compaction_handoff_state == f"{SUMMARY_PREFIX}\nfresh summary body"
+    assert compressed[0]["role"] == "system"
+    assert compressed[0]["content"].startswith("system prompt")
+    assert compressed[-2:] == [
+        {"role": "assistant", "content": "recent assistant turn"},
+        {"role": "user", "content": "latest user turn"},
+    ]
 
 
 
@@ -74,6 +80,7 @@ def test_compress_keeps_handoff_out_of_returned_transcript_messages():
         not str(msg.get("content", "")).startswith(SUMMARY_PREFIX)
         for msg in compressed
     )
+    assert all(msg.get("content") != "old user turn" for msg in compressed)
 
 
 
@@ -98,8 +105,9 @@ def test_compress_does_not_merge_handoff_into_tail_when_roles_double_collide():
         compressed = compressor.compress(messages)
 
     assert compressor._compaction_handoff_state == f"{SUMMARY_PREFIX}\nfresh summary body"
-    first_tail = next(msg for msg in compressed if msg.get("content") == "msg 6")
-    assert first_tail["content"] == "msg 6"
+    contents = [msg.get("content") for msg in compressed]
+    assert contents[0].startswith("system prompt")
+    assert contents[-3:] == ["msg 6", "msg 7", "msg 8"]
     assert all("fresh summary body" not in str(msg.get("content", "")) for msg in compressed)
 
 
@@ -296,7 +304,7 @@ def test_agent_rehydrate_persisted_compaction_handoff_loads_latest_tip_from_sess
 
 
 
-def test_agent_compress_context_persists_pending_handoff_on_new_continuation_session(tmp_path):
+def test_compress_context_rollover_drops_stale_parent_head_turns_from_continuation_transcript(tmp_path):
     from pathlib import Path
 
     from hermes_state import SessionDB
@@ -328,7 +336,86 @@ def test_agent_compress_context_persists_pending_handoff_on_new_continuation_ses
     agent._last_aux_fallback_warning_key = None
 
     compressor = MagicMock()
-    compressor.compress.return_value = [{"role": "user", "content": "compressed"}]
+    compressor.compress.return_value = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "assistant", "content": "asset-builder finished"},
+        {"role": "user", "content": "Sure go ahead"},
+    ]
+    compressor.protect_last_n = 20
+    compressor.compression_count = 1
+    compressor.last_prompt_tokens = 0
+    compressor.last_completion_tokens = 0
+    compressor._last_summary_error = None
+    compressor._last_aux_model_failure_model = None
+    compressor._last_aux_model_failure_error = None
+    compressor._compaction_handoff_state = f"{SUMMARY_PREFIX}\nhistorical snapshot"
+    agent.context_compressor = compressor
+
+    compressed_messages, _ = agent._compress_context([
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "stale smb request"},
+        {"role": "assistant", "content": "stale smb answer"},
+        {"role": "assistant", "content": "asset-builder finished"},
+        {"role": "user", "content": "Sure go ahead"},
+    ], "sys", approx_tokens=100)
+
+    assert compressed_messages == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "assistant", "content": "asset-builder finished"},
+        {"role": "user", "content": "Sure go ahead"},
+    ]
+
+    agent._flush_messages_to_session_db(compressed_messages, conversation_history=None)
+    stored = db._conn.execute(
+        "SELECT role, content FROM messages WHERE session_id=? ORDER BY id",
+        (agent.session_id,),
+    ).fetchall()
+    assert [(row[0], row[1]) for row in stored] == [
+        ("system", "system prompt"),
+        ("assistant", "asset-builder finished"),
+        ("user", "Sure go ahead"),
+    ]
+
+
+
+def test_compress_context_rollover_persists_handoff_on_new_continuation_session(tmp_path):
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="original-session", source="cli")
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = None
+    agent.commit_memory_session = lambda messages: None
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = ""
+    agent._invalidate_system_prompt = MagicMock()
+    agent._build_system_prompt = MagicMock(return_value="new system")
+    agent._cached_system_prompt = None
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._session_init_model_config = {"max_iterations": 90}
+    agent._last_flushed_db_idx = 0
+    agent._vprint = MagicMock()
+    agent._emit_warning = MagicMock()
+    agent.tools = []
+    agent.model = "test/model"
+    agent.session_id = "original-session"
+    agent.platform = "cli"
+    agent.logs_dir = Path(tmp_path)
+    agent._last_compression_summary_warning = None
+    agent._last_aux_fallback_warning_key = None
+
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "assistant", "content": "recent assistant"},
+        {"role": "user", "content": "latest user"},
+    ]
+    compressor.protect_last_n = 20
     compressor.compression_count = 1
     compressor.last_prompt_tokens = 0
     compressor.last_completion_tokens = 0
@@ -340,13 +427,59 @@ def test_agent_compress_context_persists_pending_handoff_on_new_continuation_ses
 
     old_session_id = agent.session_id
     agent._compress_context([
-        {"role": "user", "content": "m1"},
-        {"role": "assistant", "content": "m2"},
-        {"role": "user", "content": "m3"},
-        {"role": "assistant", "content": "m4"},
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "stale opener"},
+        {"role": "assistant", "content": "stale answer"},
+        {"role": "assistant", "content": "recent assistant"},
+        {"role": "user", "content": "latest user"},
     ], "sys", approx_tokens=100)
 
     assert agent.session_id != old_session_id
     continuation = db.get_session(agent.session_id)
     assert continuation["parent_session_id"] == old_session_id
     assert continuation["compaction_handoff"] == f"{SUMMARY_PREFIX}\npersist this continuity"
+
+
+
+def test_resumed_continuation_prefers_short_live_followup_over_stale_compacted_request(tmp_path):
+    from pathlib import Path
+
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session(session_id="continued-session", source="cli")
+    db.set_compaction_handoff(
+        "continued-session",
+        f"{SUMMARY_PREFIX}\n"
+        "## Latest Live Request At Compaction\n"
+        "Check whether /mnt/win-workspace is accessible after the IP change.",
+    )
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id = "continued-session"
+    agent._session_db = db
+    agent._pending_compaction_handoff = None
+    agent.context_compressor = MagicMock()
+    agent.context_compressor._compaction_handoff_state = None
+    agent.ephemeral_system_prompt = ""
+    agent.logs_dir = Path(tmp_path)
+
+    continued_messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "assistant", "content": "I added the genre/style source-ranking reference and wired it in."},
+        {"role": "user", "content": "Sure go ahead"},
+    ]
+
+    agent._rehydrate_persisted_compaction_handoff(continued_messages)
+    latest_live = agent._find_latest_live_user_message(continued_messages)
+    effective = agent._build_effective_system_prompt(
+        "base system prompt",
+        latest_live_user_message=latest_live,
+    )
+
+    assert latest_live == "Sure go ahead"
+    assert "Sure go ahead" in effective
+    assert "Check whether /mnt/win-workspace is accessible after the IP change." in effective
+    assert effective.index("Sure go ahead") > effective.index("Check whether /mnt/win-workspace is accessible after the IP change.")
+    assert all(msg.get("content") != "Check whether /mnt/win-workspace is accessible after the IP change." for msg in continued_messages)

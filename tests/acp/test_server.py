@@ -906,6 +906,9 @@ class TestSlashCommands:
         state.agent.tools = None
         original_session_db = object()
         state.agent._session_db = original_session_db
+        state.agent._pending_compaction_handoff = None
+        state.agent.context_compressor = MagicMock()
+        state.agent.context_compressor._compaction_handoff_state = None
 
         def _compress_context(messages, system_prompt, *, approx_tokens, task_id):
             assert state.agent._session_db is None
@@ -913,6 +916,12 @@ class TestSlashCommands:
             assert system_prompt == "system"
             assert approx_tokens == 40
             assert task_id == state.session_id
+            state.agent._pending_compaction_handoff = (
+                "[CONTEXT COMPACTION — HISTORICAL STATE SNAPSHOT] old task"
+            )
+            state.agent.context_compressor._compaction_handoff_state = (
+                "[CONTEXT COMPACTION — HISTORICAL STATE SNAPSHOT] old task"
+            )
             return [{"role": "user", "content": "summary"}], "new-system"
 
         state.agent._compress_context = MagicMock(side_effect=_compress_context)
@@ -942,6 +951,87 @@ class TestSlashCommands:
             task_id=state.session_id,
         )
         mock_save.assert_called_once_with(state.session_id)
+
+    def test_compact_persists_compaction_handoff_for_future_resume(self, tmp_path):
+        from run_agent import AIAgent
+
+        def _fake_agent_factory():
+            fake = AIAgent.__new__(AIAgent)
+            fake.provider = ""
+            fake.base_url = ""
+            fake.api_mode = "chat_completions"
+            fake.ephemeral_system_prompt = ""
+            fake._pending_compaction_handoff = None
+            fake.context_compressor = MagicMock()
+            fake.context_compressor._compaction_handoff_state = None
+            fake.logs_dir = tmp_path
+            return fake
+
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_fake_agent_factory, db=db)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        state = manager.create_session(cwd="/tmp")
+        state.history = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "assistant", "content": "I added the genre/style source-ranking reference and wired it in."},
+            {"role": "user", "content": "Sure go ahead"},
+        ]
+        state.agent.compression_enabled = True
+        state.agent._cached_system_prompt = "system prompt"
+        state.agent.tools = None
+        state.agent._pending_compaction_handoff = None
+        state.agent.context_compressor = MagicMock()
+        state.agent.context_compressor._compaction_handoff_state = None
+        original_session_db = object()
+        state.agent._session_db = original_session_db
+
+        stale_request = "Check whether /mnt/win-workspace is accessible after the IP change."
+
+        def _compress_context(messages, system_prompt, *, approx_tokens, task_id):
+            assert state.agent._session_db is None
+            state.agent._pending_compaction_handoff = (
+                "[CONTEXT COMPACTION — HISTORICAL STATE SNAPSHOT]\n"
+                "## Latest Live Request At Compaction\n"
+                f"{stale_request}"
+            )
+            state.agent.context_compressor._compaction_handoff_state = state.agent._pending_compaction_handoff
+            return [
+                {"role": "system", "content": "system prompt"},
+                {"role": "assistant", "content": "I added the genre/style source-ranking reference and wired it in."},
+                {"role": "user", "content": "Sure go ahead"},
+            ], "new-system"
+
+        state.agent._compress_context = MagicMock(side_effect=_compress_context)
+
+        with patch(
+            "agent.model_metadata.estimate_request_tokens_rough",
+            side_effect=[80, 24],
+        ):
+            result = acp_agent._handle_slash_command("/compact", state)
+
+        assert "Context compressed: 3 -> 3 messages" in result
+
+        restored_manager = SessionManager(agent_factory=_fake_agent_factory, db=db)
+        restored = restored_manager.get_session(state.session_id)
+        assert restored is not None
+        assert restored.history == [
+            {"role": "system", "content": "system prompt"},
+            {"role": "assistant", "content": "I added the genre/style source-ranking reference and wired it in."},
+            {"role": "user", "content": "Sure go ahead"},
+        ]
+        restored.agent._session_db = db
+        restored.agent.session_id = restored.session_id
+        restored.agent._rehydrate_persisted_compaction_handoff(restored.history)
+        latest_live = restored.agent._find_latest_live_user_message(restored.history)
+        effective = restored.agent._build_effective_system_prompt(
+            "base system prompt",
+            latest_live_user_message=latest_live,
+        )
+
+        assert latest_live == "Sure go ahead"
+        assert stale_request in effective
+        assert "Sure go ahead" in effective
+        assert effective.index("Sure go ahead") > effective.index(stale_request)
 
     def test_unknown_command_returns_none(self, agent, mock_manager):
         state = self._make_state(mock_manager)

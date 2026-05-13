@@ -80,17 +80,41 @@ class TestCompress:
         compressor.compress(msgs)
         assert compressor.compression_count == 2
 
-    def test_protects_first_and_last(self, compressor):
-        msgs = self._make_messages(10)
+    def test_protects_system_head_and_recent_tail(self, compressor):
+        compressor.tail_token_budget = 1
+        msgs = [{"role": "system", "content": "system prompt"}] + self._make_messages(10)
         result = compressor.compress(msgs)
-        # First 2 messages should be preserved (protect_first_n=2)
-        # Last 2 messages should be preserved (protect_last_n=2)
+        # System prompt should remain the only preserved head message.
+        assert result[0]["role"] == "system"
+        assert result[0]["content"].startswith("system prompt")
+        # Last 2 messages should be preserved in the tail.
         assert result[-1]["content"] == msgs[-1]["content"]
-        # The second-to-last tail message may have the summary merged
-        # into it when a double-collision prevents a standalone summary
-        # (head=assistant, tail=user in this fixture).  Verify the
-        # original content is present in either case.
-        assert msgs[-2]["content"] in result[-2]["content"]
+        assert result[-2]["content"] == msgs[-2]["content"]
+
+    def test_drops_non_system_head_turns_from_returned_transcript(self, compressor):
+        compressor.tail_token_budget = 1
+        compressor.protect_last_n = 1
+        msgs = [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "stale opening ask"},
+            {"role": "assistant", "content": "stale opening reply"},
+            {"role": "user", "content": "middle turn"},
+            {"role": "assistant", "content": "recent assistant turn"},
+            {"role": "user", "content": "latest live turn"},
+        ]
+
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = "historical summary"
+            mock_call.return_value = mock_response
+            result = compressor.compress(msgs)
+
+        contents = [msg.get("content") for msg in result]
+        assert "stale opening ask" not in contents
+        assert "stale opening reply" not in contents
+        assert result[0]["content"].startswith("system prompt")
+        assert result[-1]["content"] == "latest live turn"
 
 
 class TestGenerateSummaryNoneContent:
@@ -1032,13 +1056,13 @@ class TestSummaryTargetRatio:
         """Tail token budget should be threshold_tokens * summary_target_ratio."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 200K * 0.50 threshold * 0.40 ratio = 40K
-        assert c.tail_token_budget == 40_000
+        # 200K * 0.75 threshold * 0.40 ratio = 60K
+        assert c.tail_token_budget == 60_000
 
         with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.40)
-        # 1M * 0.50 threshold * 0.40 ratio = 200K
-        assert c.tail_token_budget == 200_000
+        # 1M * 0.75 threshold * 0.40 ratio = 300K
+        assert c.tail_token_budget == 300_000
 
     def test_summary_cap_scales_with_context(self):
         """Max summary tokens should be 5% of context, capped at 12K."""
@@ -1180,20 +1204,16 @@ class TestTokenBudgetTailProtection:
         assert tail_size >= 3
 
     def test_small_conversation_still_compresses(self, budget_compressor):
-        """With the new min of 8 messages (head=2 + 3 + 1 guard + 2 middle),
-        a small but compressible conversation should still compress."""
+        """A small conversation with an explicit system head and token pressure should still compress."""
         c = budget_compressor
-        # 9 messages: head(2) + 4 middle + 3 tail = compressible
-        messages = []
-        for i in range(9):
+        c.tail_token_budget = 1
+        messages = [{"role": "system", "content": "system prompt"}]
+        for i in range(8):
             role = "user" if i % 2 == 0 else "assistant"
             messages.append({"role": role, "content": f"Message {i}"})
 
-        # Should not early-return (needs > protect_first_n + 3 + 1 = 6)
-        # Mock the summary generation to avoid real API call
         with patch.object(c, "_generate_summary", return_value="Summary of conversation"):
             result = c.compress(messages, current_tokens=90_000)
-        # Should have compressed (fewer messages than original)
         assert len(result) < len(messages)
 
     def test_prune_with_token_budget(self, budget_compressor):

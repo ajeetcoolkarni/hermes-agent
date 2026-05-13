@@ -11119,8 +11119,7 @@ class AIAgent:
         # 4xx and abort the request entirely).
         if (
             self.compression_enabled
-            and len(messages) > self.context_compressor.protect_first_n
-                                + self.context_compressor.protect_last_n + 1
+            and len(messages) > self.context_compressor.protect_last_n + 1
         ):
             # Include tool schema tokens — with many tools these can add
             # 20-30K+ tokens that the old sys+msg estimate missed entirely.
