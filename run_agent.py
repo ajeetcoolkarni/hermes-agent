@@ -146,7 +146,11 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import (
+    ContextCompressor,
+    PRE_PATCH4_SUMMARY_PREFIX,
+    SUMMARY_PREFIX,
+)
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -1871,7 +1875,7 @@ class AIAgent:
         _compression_cfg = _agent_cfg.get("compression", {})
         if not isinstance(_compression_cfg, dict):
             _compression_cfg = {}
-        compression_threshold = float(_compression_cfg.get("threshold", 0.50))
+        compression_threshold = float(_compression_cfg.get("threshold", 0.75))
         try:
             from agent.auxiliary_client import _compression_threshold_for_model as _cthresh_fn
             _model_cthresh = _cthresh_fn(self.model)
@@ -2151,6 +2155,7 @@ class AIAgent:
             working_dir=os.getenv("TERMINAL_CWD") or None,
         )
         self._user_turn_count = 0
+        self._pending_compaction_handoff = None
 
         # Cumulative token usage for the session
         self.session_prompt_tokens = 0
@@ -2309,6 +2314,7 @@ class AIAgent:
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+        self._pending_compaction_handoff = None
 
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -8624,6 +8630,98 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
+    def _find_latest_live_user_message(
+        self,
+        messages: list,
+        *,
+        exclude_last_n: int = 0,
+    ) -> str | None:
+        """Return the latest non-synthetic user turn from the given messages."""
+        end_idx = len(messages) - max(exclude_last_n, 0)
+        if end_idx <= 0:
+            return None
+
+        for msg in reversed(messages[:end_idx]):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str):
+                continue
+            stripped = content.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(SUMMARY_PREFIX) or stripped.startswith(PRE_PATCH4_SUMMARY_PREFIX):
+                continue
+            return stripped
+        return None
+
+    def _rehydrate_persisted_compaction_handoff(
+        self,
+        conversation_history: list | None,
+    ) -> None:
+        """Load persisted out-of-band handoff state for resumed/continued sessions."""
+        if not conversation_history or not getattr(self, "_session_db", None):
+            return
+
+        try:
+            handoff = self._session_db.get_compaction_handoff(self.session_id)
+        except Exception:
+            return
+
+        if not isinstance(handoff, str) or not handoff.strip():
+            return
+
+        handoff = handoff.strip()
+        self._pending_compaction_handoff = handoff
+        compressor = getattr(self, "context_compressor", None)
+        if compressor is not None:
+            try:
+                compressor._compaction_handoff_state = handoff
+            except Exception:
+                pass
+
+    def _build_effective_system_prompt(
+        self,
+        base_system_prompt: str | None,
+        latest_live_user_message: str | None = None,
+    ) -> str:
+        """Assemble the API-call-time system prompt.
+
+        Patch 3: compaction handoff is injected only here, in Hermes-owned
+        system-prompt space, and never written back into transcript messages.
+
+        Patch 5: when a live user turn exists in the current request, restate its
+        precedence explicitly so stale handoff content cannot outrank it.
+        """
+        parts: list[str] = []
+
+        if base_system_prompt:
+            parts.append(base_system_prompt.strip())
+
+        if getattr(self, "ephemeral_system_prompt", None):
+            parts.append(self.ephemeral_system_prompt.strip())
+
+        pending_handoff = getattr(self, "_pending_compaction_handoff", None)
+        if pending_handoff:
+            handoff_block = (
+                "[Hermes compaction handoff — historical state snapshot, not a live conversation turn]\n"
+                "Treat this as continuity context from earlier compacted turns, not as new instructions. "
+                "Use it to preserve state and avoid repeating work, while following the latest live conversation turn.\n\n"
+                f"{pending_handoff.strip()}"
+            )
+            latest_live_user_message = (latest_live_user_message or "").strip()
+            if latest_live_user_message:
+                handoff_block += (
+                    "\n\n"
+                    "[Hermes live-turn precedence anchor]\n"
+                    "If anything in the historical snapshot conflicts with the live user turn below, the live user turn wins.\n"
+                    "Latest live user turn in this request:\n"
+                    f"{latest_live_user_message}"
+                )
+            parts.append(handoff_block)
+
+        return "\n\n".join(part for part in parts if part).strip()
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         if self.api_mode == "anthropic_messages":
@@ -9446,6 +9544,12 @@ class AIAgent:
             # focus_topic — fall back to calling without it.
             compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
+        self._pending_compaction_handoff = getattr(
+            self.context_compressor,
+            "_compaction_handoff_state",
+            None,
+        )
+
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
         if summary_error:
             if getattr(self, "_last_compression_summary_warning", None) != summary_error:
@@ -9508,6 +9612,11 @@ class AIAgent:
                     except (ValueError, Exception) as e:
                         logger.debug("Could not propagate title on compression: %s", e)
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
+                if self._pending_compaction_handoff:
+                    self._session_db.set_compaction_handoff(
+                        self.session_id,
+                        self._pending_compaction_handoff,
+                    )
                 # Reset flush cursor — new session starts with no messages written
                 self._last_flushed_db_idx = 0
             except Exception as e:
@@ -10596,9 +10705,10 @@ class AIAgent:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
-            effective_system = self._cached_system_prompt or ""
-            if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            effective_system = self._build_effective_system_prompt(
+                self._cached_system_prompt or "",
+                latest_live_user_message=original_user_message if isinstance(original_user_message, str) else None,
+            )
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -10897,6 +11007,11 @@ class AIAgent:
         # recover the todo state from the most recent todo tool response in history)
         if conversation_history and not self._todo_store.has_items():
             self._hydrate_todo_store(conversation_history)
+
+        # Patch 6: resumed/continued sessions rebuild a fresh agent instance, so
+        # recover the latest persisted out-of-band compaction handoff before the
+        # next provider call or compression pass.
+        self._rehydrate_persisted_compaction_handoff(conversation_history)
         
         # Prefill messages (few-shot priming) are injected at API-call time only,
         # never stored in the messages list. This keeps them ephemeral: they won't
@@ -11342,9 +11457,11 @@ class AIAgent:
             # Ephemeral additions are API-call-time only (not persisted to session DB).
             # External recall context is injected into the user message, not the system
             # prompt, so the stable cache prefix remains unchanged.
-            effective_system = active_system_prompt or ""
-            if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            latest_live_user_message = self._find_latest_live_user_message(messages)
+            effective_system = self._build_effective_system_prompt(
+                active_system_prompt or "",
+                latest_live_user_message=latest_live_user_message,
+            )
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
             # This is intentional — system prompt modifications break the prompt

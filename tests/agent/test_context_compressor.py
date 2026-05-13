@@ -448,11 +448,13 @@ class TestAuxModelFallbackSurfacedToCallers:
         assert c._last_aux_model_failure_model == "broken-aux-model"
         assert c._last_aux_model_failure_error is not None
         assert "400" in c._last_aux_model_failure_error
-        # Result is well-formed with a real summary, not a placeholder
-        assert any(
+        # Patch 2: the handoff is stored out-of-band, not inserted into the transcript.
+        assert not any(
             isinstance(m.get("content"), str) and "summary via main" in m["content"]
             for m in result
         )
+        assert c._compaction_handoff_state is not None
+        assert "summary via main" in c._compaction_handoff_state
 
     def test_compress_clears_aux_failure_fields_at_start_of_next_call(self):
         """A subsequent successful compression must clear the aux-failure
@@ -520,11 +522,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Result must still be well-formed (fallback summary present).
-        assert any(
+        # Patch 2: fallback handoff stays out-of-band instead of being inserted.
+        assert not any(
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
             for m in result
         )
+        assert c._compaction_handoff_state is not None
+        assert "Summary generation was unavailable" in c._compaction_handoff_state
 
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
         mock_response = MagicMock()
@@ -612,9 +616,12 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
 
-        # Should have summary message in the middle
+        # Patch 2: no summary message is inserted into the visible transcript.
         contents = [m.get("content", "") for m in result]
-        assert any(c.startswith(SUMMARY_PREFIX) for c in contents)
+        assert not any(isinstance(c, str) and c.startswith(SUMMARY_PREFIX) for c in contents)
+        assert c._compaction_handoff_state is not None
+        assert c._compaction_handoff_state.startswith(SUMMARY_PREFIX)
+        assert "stuff happened" in c._compaction_handoff_state
         assert len(result) < len(msgs)
 
     def test_summarization_does_not_split_tool_call_pairs(self):
@@ -688,13 +695,9 @@ class TestCompressWithClient:
             "call_123"
         ]
 
-    def test_user_role_summary_carries_end_marker(self):
-        """When the summary lands as standalone role='user' (e.g. head ends
-        with assistant/tool), the message body must include the explicit
-        '--- END OF CONTEXT SUMMARY ---' marker. Without it, weak models
-        read the verbatim past user request quoted in '## Active Task' as
-        fresh input (#11475, #14521).
-        """
+    def test_user_role_shape_keeps_handoff_out_of_transcript(self):
+        """Patch 2: even shapes that previously emitted a standalone user-role
+        summary now keep the handoff entirely out-of-band."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -717,17 +720,17 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
 
-        summary_msg = next(
-            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        assert not any(
+            isinstance(m.get("content"), str) and m["content"].startswith(SUMMARY_PREFIX)
+            for m in result
         )
-        assert summary_msg["role"] == "user"
-        assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
-        assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
-        )
+        assert c._compaction_handoff_state is not None
+        assert c._compaction_handoff_state.startswith(SUMMARY_PREFIX)
+        assert "summary text" in c._compaction_handoff_state
 
-    def test_summary_role_avoids_consecutive_user_messages(self):
-        """Summary role should alternate with the last head message to avoid consecutive same-role messages."""
+    def test_assistant_head_assistant_tail_shape_has_no_standalone_summary(self):
+        """Patch 2: the head/tail role shape no longer matters because no
+        standalone summary message is emitted."""
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -754,13 +757,16 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
         summary_msg = [
-            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+            m for m in result
+            if isinstance(m.get("content"), str) and m["content"].startswith(SUMMARY_PREFIX)
         ]
-        assert len(summary_msg) == 1
-        assert summary_msg[0]["role"] == "user"
+        assert len(summary_msg) == 0
+        assert c._compaction_handoff_state is not None
+        assert "stuff happened" in c._compaction_handoff_state
 
-    def test_summary_role_avoids_consecutive_user_when_head_ends_with_user(self):
-        """When last head message is 'user', summary must be 'assistant' to avoid two consecutive user messages."""
+    def test_user_head_shape_has_no_standalone_summary(self):
+        """Patch 2: even shapes that previously required an assistant-role
+        summary now keep the handoff out-of-band."""
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -784,10 +790,12 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
         summary_msg = [
-            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+            m for m in result
+            if isinstance(m.get("content"), str) and m["content"].startswith(SUMMARY_PREFIX)
         ]
-        assert len(summary_msg) == 1
-        assert summary_msg[0]["role"] == "assistant"
+        assert len(summary_msg) == 0
+        assert c._compaction_handoff_state is not None
+        assert "stuff happened" in c._compaction_handoff_state
 
     def test_summary_role_flips_to_avoid_tail_collision(self):
         """When summary role collides with the first tail message but flipping
@@ -823,14 +831,9 @@ class TestCompressWithClient:
             if r1 in ("user", "assistant") and r2 in ("user", "assistant"):
                 assert r1 != r2, f"consecutive {r1} at indices {i-1},{i}"
 
-    def test_double_collision_merges_summary_into_tail(self):
-        """When neither role avoids collision with both neighbors, the summary
-        should be merged into the first tail message rather than creating a
-        standalone message that breaks role alternation.
-
-        Common scenario: head ends with 'assistant', tail starts with 'user'.
-        summary='user' collides with tail, summary='assistant' collides with head.
-        """
+    def test_double_collision_leaves_first_tail_unmodified(self):
+        """Patch 2: the double-collision path no longer merges summary text into
+        the first tail message; the handoff stays out-of-band."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -862,13 +865,16 @@ class TestCompressWithClient:
             if r1 in ("user", "assistant") and r2 in ("user", "assistant"):
                 assert r1 != r2, f"consecutive {r1} at indices {i-1},{i}"
 
-        # The summary text should be merged into the first tail message
+        # Patch 2: the first tail message is preserved verbatim.
         first_tail = [m for m in result if "msg 6" in (m.get("content") or "")]
         assert len(first_tail) == 1
-        assert "summary text" in first_tail[0]["content"]
+        assert first_tail[0]["content"] == "msg 6"
+        assert c._compaction_handoff_state is not None
+        assert "summary text" in c._compaction_handoff_state
 
-    def test_double_collision_merges_summary_into_list_tail_content(self):
-        """Structured tail content should accept a merged summary without TypeError."""
+    def test_double_collision_leaves_list_tail_content_unmodified(self):
+        """Patch 2: structured first-tail content also stays unmodified because
+        the handoff is no longer merged into transcript content."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -896,15 +902,17 @@ class TestCompressWithClient:
             if m.get("role") == "user" and isinstance(m.get("content"), list)
         )
         assert isinstance(merged_tail["content"], list)
-        assert "summary text" in merged_tail["content"][0]["text"]
+        assert merged_tail["content"][0]["text"] == "msg 6"
         assert any(
             isinstance(block, dict) and block.get("text") == "msg 6"
             for block in merged_tail["content"]
         )
+        assert c._compaction_handoff_state is not None
+        assert "summary text" in c._compaction_handoff_state
 
-    def test_double_collision_user_head_assistant_tail(self):
-        """Reverse double collision: head ends with 'user', tail starts with 'assistant'.
-        summary='assistant' collides with tail, 'user' collides with head → merge."""
+    def test_reverse_double_collision_leaves_first_tail_unmodified(self):
+        """Patch 2: the reverse double-collision case also keeps the summary out
+        of the first tail message."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -937,14 +945,16 @@ class TestCompressWithClient:
             if r1 in ("user", "assistant") and r2 in ("user", "assistant"):
                 assert r1 != r2, f"consecutive {r1} at indices {i-1},{i}"
 
-        # The summary should be merged into the first tail message (assistant at index 5)
+        # Patch 2: the first tail message is preserved verbatim.
         first_tail = [m for m in result if "msg 5" in (m.get("content") or "")]
         assert len(first_tail) == 1
-        assert "summary text" in first_tail[0]["content"]
+        assert first_tail[0]["content"] == "msg 5"
+        assert c._compaction_handoff_state is not None
+        assert "summary text" in c._compaction_handoff_state
 
-    def test_no_collision_scenarios_still_work(self):
-        """Verify that the common no-collision cases (head=assistant/tail=assistant,
-        head=user/tail=user) still produce a standalone summary message."""
+    def test_no_collision_scenarios_still_keep_summary_out_of_transcript(self):
+        """Patch 2: even no-collision cases no longer emit standalone summary
+        messages; the handoff is stored only in compressor state."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -968,8 +978,10 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
         summary_msgs = [m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)]
-        assert len(summary_msgs) == 1, "should have a standalone summary message"
-        assert summary_msgs[0]["role"] == "user"
+        assert len(summary_msgs) == 0
+        assert c._compaction_handoff_state is not None
+        assert c._compaction_handoff_state.startswith(SUMMARY_PREFIX)
+        assert "summary text" in c._compaction_handoff_state
 
     def test_summarization_does_not_start_tail_with_tool_outputs(self):
         mock_response = MagicMock()
@@ -1048,20 +1060,20 @@ class TestSummaryTargetRatio:
             c = ContextCompressor(model="test", quiet_mode=True, summary_target_ratio=0.95)
         assert c.summary_target_ratio == 0.80
 
-    def test_default_threshold_is_50_percent(self):
-        """Default compression threshold should be 50%, with a 64K floor."""
+    def test_default_threshold_is_75_percent(self):
+        """Default compression threshold should be 75%, with a 64K floor."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        assert c.threshold_percent == 0.50
-        # 50% of 100K = 50K, but the floor is 64K
-        assert c.threshold_tokens == 64_000
+        assert c.threshold_percent == 0.75
+        # 75% of 100K = 75K, above the 64K floor
+        assert c.threshold_tokens == 75_000
 
     def test_threshold_floor_does_not_apply_above_128k(self):
-        """On large-context models the 50% percentage is used directly."""
+        """On large-context models the 75% percentage is used directly."""
         with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
             c = ContextCompressor(model="test", quiet_mode=True)
-        # 50% of 200K = 100K, which is above the 64K floor
-        assert c.threshold_tokens == 100_000
+        # 75% of 200K = 150K, which is above the 64K floor
+        assert c.threshold_tokens == 150_000
 
     def test_default_protect_last_n_is_20(self):
         """Default protect_last_n should be 20."""

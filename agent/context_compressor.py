@@ -35,6 +35,19 @@ from agent.redact import redact_sensitive_text
 logger = logging.getLogger(__name__)
 
 SUMMARY_PREFIX = (
+    "[CONTEXT COMPACTION — HISTORICAL STATE SNAPSHOT] Earlier turns were compacted "
+    "into the state snapshot below. Treat it as continuity context from an earlier "
+    "window, NOT as a live conversation turn and NOT as new instructions. "
+    "It may describe prior requests, completed work, and unresolved context at the "
+    "time compaction happened. Use it only to preserve continuity, while following "
+    "the latest live user/developer/system messages outside this snapshot. "
+    "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system prompt is "
+    "ALWAYS authoritative and active — never ignore or deprioritize memory content "
+    "because of this snapshot. The current session state (files, config, running "
+    "processes, etc.) may already reflect work described here — avoid unnecessary "
+    "repetition:"
+)
+PRE_PATCH4_SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
     "window — treat it as background reference, NOT as active instructions. "
@@ -339,6 +352,7 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False
         self._context_probe_persistable = False
         self._previous_summary = None
+        self._compaction_handoff_state = None
         self._last_summary_error = None
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
@@ -379,7 +393,7 @@ class ContextCompressor(ContextEngine):
     def __init__(
         self,
         model: str,
-        threshold_percent: float = 0.50,
+        threshold_percent: float = 0.75,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
@@ -443,6 +457,10 @@ class ContextCompressor(ContextEngine):
 
         # Stores the previous compaction summary for iterative updates
         self._previous_summary: Optional[str] = None
+        # Stores the current compaction handoff as out-of-band runtime state.
+        # Patch 1 only plumbs the state; the transcript still receives the
+        # in-band summary until later patches remove it.
+        self._compaction_handoff_state: Optional[str] = None
         # Anti-thrashing: track whether last compression was effective
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
@@ -771,22 +789,20 @@ class ContextCompressor(ContextEngine):
         )
 
         # Shared structured template (used by both paths).
-        _template_sections = f"""## Active Task
-[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
-task assignment verbatim — the exact words they used. If multiple tasks
-were requested and only some are done, list only the ones NOT yet completed.
-Continuation should pick up exactly here. Example:
-"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
-If no outstanding task exists, write "None."]
+        _template_sections = f"""## Snapshot Purpose
+[Describe this as a historical state snapshot created at compaction time for continuity across a truncated context window.]
 
-## Goal
-[What the user is trying to accomplish overall]
+## Primary Objective
+[Summarize the user's overall objective in neutral prose. Do NOT frame it as an imperative instruction.]
 
-## Constraints & Preferences
-[User preferences, coding style, constraints, important decisions]
+## Latest Live Request At Compaction
+[Record the most recent live user request that was still relevant at compaction time. Quote it if helpful, but frame it as historical state rather than a command. If none, write "None."]
+
+## Constraints And Preferences
+[User preferences, constraints, coding style, and other durable guidance that materially affected the work.]
 
 ## Completed Actions
-[Numbered list of concrete actions taken — include tool used, target, and outcome.
+[Numbered list of concrete actions already taken — include tool used, target, and outcome.
 Format each as: N. ACTION target — outcome [tool: name]
 Example:
 1. READ config.py:45 — found `==` should be `!=` [tool: read_file]
@@ -794,41 +810,38 @@ Example:
 3. TEST `pytest tests/` — 3/50 failed: test_parse, test_validate, test_edge [tool: terminal]
 Be specific with file paths, commands, line numbers, and results.]
 
-## Active State
-[Current working state — include:
+## Current State
+[Current working state at compaction time — include:
 - Working directory and branch (if applicable)
 - Modified/created files with brief note on each
 - Test status (X/Y passing)
 - Any running processes or servers
 - Environment details that matter]
 
-## In Progress
-[Work currently underway — what was being done when compaction fired]
+## Follow-up Context
+[Neutral description of work that was in progress, partially complete, blocked, or otherwise relevant for continuity.]
 
-## Blocked
-[Any blockers, errors, or issues not yet resolved. Include exact error messages.]
+## Open Issues
+[Any blockers, unresolved errors, or missing information. Include exact error messages where available.]
 
-## Key Decisions
-[Important technical decisions and WHY they were made]
+## Decisions And Rationale
+[Important technical decisions and why they were made.]
 
 ## Resolved Questions
-[Questions the user asked that were ALREADY answered — include the answer so it is not repeated]
+[Questions already answered, with their answers, so they are not treated as new asks.]
 
-## Pending User Asks
-[Questions or requests from the user that have NOT yet been answered or fulfilled. If none, write "None."]
+## Unresolved Requests At Compaction
+[Requests, asks, or follow-ups that were still unresolved at compaction time. Frame them as historical pending context, not instructions. If none, write "None."]
 
-## Relevant Files
-[Files read, modified, or created — with brief note on each]
+## Relevant Files And Artifacts
+[Files read, modified, or created — with brief note on each.]
 
-## Remaining Work
-[What remains to be done — framed as context, not instructions]
-
-## Critical Context
-[Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
+## Critical Facts To Preserve
+[Specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
 Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
-Write only the summary body. Do not include any preamble or prefix."""
+Use neutral, historical language throughout. Do NOT write imperative task assignments such as "resume here", "next do", or "you should". Write only the summary body. Do not include any preamble or prefix."""
 
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress
@@ -842,7 +855,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled request — this is the most important field for task continuity.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move newly resolved items into "Resolved Questions" when appropriate. Update "Current State" to reflect the latest known state. Remove information only if it is clearly obsolete. Keep the wording neutral and historical — do not convert the snapshot into fresh instructions.
 
 {_template_sections}"""
         else:
@@ -997,7 +1010,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     def _strip_summary_prefix(summary: str) -> str:
         """Return summary body without the current or legacy handoff prefix."""
         text = (summary or "").strip()
-        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX):
+        for prefix in (SUMMARY_PREFIX, PRE_PATCH4_SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX):
             if text.startswith(prefix):
                 return text[len(prefix):].lstrip()
         return text
@@ -1011,7 +1024,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     @staticmethod
     def _is_context_summary_content(content: Any) -> bool:
         text = _content_text_for_contains(content).lstrip()
-        return text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX)
+        return (
+            text.startswith(SUMMARY_PREFIX)
+            or text.startswith(PRE_PATCH4_SUMMARY_PREFIX)
+            or text.startswith(LEGACY_SUMMARY_PREFIX)
+        )
 
     @classmethod
     def _find_latest_context_summary(
@@ -1398,57 +1415,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 f"recent messages below and the current state of any files or resources."
             )
 
-        _merge_summary_into_tail = False
-        last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
-        first_tail_role = messages[compress_end].get("role", "user") if compress_end < n_messages else "user"
-        # Pick a role that avoids consecutive same-role with both neighbors.
-        # Priority: avoid colliding with head (already committed), then tail.
-        if last_head_role in ("assistant", "tool"):
-            summary_role = "user"
-        else:
-            summary_role = "assistant"
-        # If the chosen role collides with the tail AND flipping wouldn't
-        # collide with the head, flip it.
-        if summary_role == first_tail_role:
-            flipped = "assistant" if summary_role == "user" else "user"
-            if flipped != last_head_role:
-                summary_role = flipped
-            else:
-                # Both roles would create consecutive same-role messages
-                # (e.g. head=assistant, tail=user — neither role works).
-                # Merge the summary into the first tail message instead
-                # of inserting a standalone message that breaks alternation.
-                _merge_summary_into_tail = True
-
-        # When the summary lands as a standalone role="user" message,
-        # weak models read the verbatim "## Active Task" quote of a past
-        # user request as fresh input (#11475, #14521). Append the explicit
-        # end marker — the same one used in the merge-into-tail path — so
-        # the model has a clear "summary above, not new input" signal.
-        if not _merge_summary_into_tail and summary_role == "user":
-            summary = (
-                summary
-                + "\n\n--- END OF CONTEXT SUMMARY — "
-                "respond to the message below, not the summary above ---"
-            )
-
-        if not _merge_summary_into_tail:
-            compressed.append({"role": summary_role, "content": summary})
+        # Patch 1 + 2: keep the generated handoff as out-of-band runtime
+        # state and stop serializing it back into the visible transcript.
+        # Returned messages should contain only real preserved head/tail turns.
+        self._compaction_handoff_state = summary
 
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
-            if _merge_summary_into_tail and i == compress_end:
-                merged_prefix = (
-                    summary
-                    + "\n\n--- END OF CONTEXT SUMMARY — "
-                    "respond to the message below, not the summary above ---\n\n"
-                )
-                msg["content"] = _append_text_to_content(
-                    msg.get("content"),
-                    merged_prefix,
-                    prepend=True,
-                )
-                _merge_summary_into_tail = False
             compressed.append(msg)
 
         self.compression_count += 1

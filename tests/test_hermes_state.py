@@ -136,6 +136,36 @@ class TestSessionLifecycle:
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
 
+    def test_set_and_get_compaction_handoff(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        db.set_compaction_handoff("s1", "handoff payload")
+
+        session = db.get_session("s1")
+        assert session["compaction_handoff"] == "handoff payload"
+        assert db.get_compaction_handoff("s1") == "handoff payload"
+
+    def test_get_compaction_handoff_projects_forward_to_latest_compression_tip(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.end_session("root", "compression")
+
+        db.create_session(session_id="child", source="cli", parent_session_id="root")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = (SELECT ended_at FROM sessions WHERE id = 'root') + 1 WHERE id = 'child'"
+        )
+        db.end_session("child", "compression")
+
+        db.create_session(session_id="tail", source="cli", parent_session_id="child")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = (SELECT ended_at FROM sessions WHERE id = 'child') + 1 WHERE id = 'tail'"
+        )
+        db._conn.commit()
+        db.set_compaction_handoff("tail", "latest persisted handoff")
+
+        assert db.get_compaction_handoff("root") == "latest persisted handoff"
+        assert db.get_compaction_handoff("child") == "latest persisted handoff"
+        assert db.get_compaction_handoff("tail") == "latest persisted handoff"
+
 
 # =========================================================================
 # Message storage
@@ -1414,7 +1444,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 11
+        assert version == 12
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1706,12 +1736,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v9
+        # Open with SessionDB — should migrate to the current schema version
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 11
+        assert cursor.fetchone()[0] == 12
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -2906,7 +2936,7 @@ class TestFTS5ToolCallMigration:
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == 11
+            assert version == 12
         finally:
             session_db.close()
 

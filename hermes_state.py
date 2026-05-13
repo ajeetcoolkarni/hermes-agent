@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
+    compaction_handoff TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -583,6 +584,18 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def set_compaction_handoff(self, session_id: str, handoff: Optional[str]) -> None:
+        """Persist out-of-band compaction handoff text on the session row."""
+        self._insert_session_row(session_id, "unknown")
+        handoff_value = handoff.strip() if isinstance(handoff, str) and handoff.strip() else None
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compaction_handoff = ? WHERE id = ?",
+                (handoff_value, session_id),
+            )
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -991,6 +1004,28 @@ class SessionDB:
                 return current
             current = row["id"]
         return current
+
+    def get_compaction_handoff(self, session_id: str) -> Optional[str]:
+        """Return the persisted compaction handoff for a session lineage.
+
+        Projects compression roots or intermediate continuation IDs forward to the
+        latest compression tip before reading the handoff, so resume/restart can
+        recover the freshest out-of-band state from any known session ID in the
+        chain.
+        """
+        if not session_id:
+            return None
+
+        tip_id = self.get_compression_tip(session_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT compaction_handoff FROM sessions WHERE id = ?",
+                (tip_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["compaction_handoff"] if hasattr(row, "keys") else row[0]
+        return value or None
 
     def list_sessions_rich(
         self,
