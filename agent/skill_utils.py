@@ -172,62 +172,81 @@ def _normalize_string_set(values) -> Set[str]:
 
 
 def get_external_skills_dirs() -> List[Path]:
-    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
+    """Return non-local skill directories visible to the active profile.
 
-    Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
-    path.  Only directories that actually exist are returned.  Duplicates and
-    paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
+    Sources, in precedence order after the profile-local ``get_skills_dir()``:
+
+    1. ``skills.external_dirs`` from the active profile's ``config.yaml``
+    2. The shared root ``<default-hermes-root>/skills`` when running inside a
+       named profile (e.g. ``~/.hermes/profiles/orchestrator``)
+
+    Each configured entry is expanded (``~`` and ``${VAR}``) and resolved to an
+    absolute path relative to ``HERMES_HOME`` when needed. Only directories that
+    actually exist are returned. Duplicates and paths that resolve to the local
+    profile skills dir are silently skipped.
+
+    The implicit shared-root skills dir is what lets named profiles consume
+    board/task skills created in the shared default install without forcing
+    every profile to duplicate those skills on disk.
     """
-    config_path = get_config_path()
-    if not config_path.exists():
-        return []
-    try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if not isinstance(parsed, dict):
-        return []
-
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return []
-
-    raw_dirs = skills_cfg.get("external_dirs")
-    if not raw_dirs:
-        return []
-    if isinstance(raw_dirs, str):
-        raw_dirs = [raw_dirs]
-    if not isinstance(raw_dirs, list):
-        return []
-
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_default_hermes_root, get_hermes_home
 
     hermes_home = get_hermes_home()
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
     result: List[Path] = []
 
+    def _add_dir(path: Path) -> None:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            return
+        if resolved == local_skills:
+            return
+        if resolved in seen:
+            return
+        if resolved.is_dir():
+            seen.add(resolved)
+            result.append(resolved)
+        else:
+            logger.debug("External skills dir does not exist, skipping: %s", resolved)
+
+    raw_dirs = []
+    config_path = get_config_path()
+    if config_path.exists():
+        try:
+            parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            skills_cfg = parsed.get("skills")
+            if isinstance(skills_cfg, dict):
+                raw_dirs = skills_cfg.get("external_dirs") or []
+                if isinstance(raw_dirs, str):
+                    raw_dirs = [raw_dirs]
+                elif not isinstance(raw_dirs, list):
+                    raw_dirs = []
+
     for entry in raw_dirs:
         entry = str(entry).strip()
         if not entry:
             continue
-        # Expand ~ and environment variables
         expanded = os.path.expanduser(os.path.expandvars(entry))
         p = Path(expanded)
-        # Resolve relative paths against HERMES_HOME, not cwd
         if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
-        if p == local_skills:
-            continue
-        if p in seen:
-            continue
-        if p.is_dir():
-            seen.add(p)
-            result.append(p)
-        else:
-            logger.debug("External skills dir does not exist, skipping: %s", p)
+            p = hermes_home / p
+        _add_dir(p)
+
+    # Named profiles have their own HERMES_HOME but should still be able to use
+    # skills stored in the shared Hermes root (e.g. ~/.hermes/skills). This is
+    # intentionally additive: profile-local skills still win, and explicit
+    # external_dirs above keep their existing precedence.
+    try:
+        shared_skills = (get_default_hermes_root() / "skills").resolve()
+    except Exception:
+        shared_skills = None
+    if shared_skills is not None:
+        _add_dir(shared_skills)
 
     return result
 

@@ -502,6 +502,9 @@ class CreateTaskBody(BaseModel):
     triage: bool = False
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    phase_name: Optional[str] = None
+    phase_index: Optional[int] = None
+    phase_total: Optional[int] = None
     skills: Optional[list[str]] = None
 
 
@@ -524,6 +527,9 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
+            phase_name=payload.phase_name,
+            phase_index=payload.phase_index,
+            phase_total=payload.phase_total,
             skills=payload.skills,
         )
         task = kanban_db.get_task(conn, task_id)

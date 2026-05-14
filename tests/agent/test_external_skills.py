@@ -103,6 +103,21 @@ class TestGetAllSkillsDirs:
         assert result[0] == hermes_home / "skills"
         assert result[1] == external_skills_dir.resolve()
 
+    def test_named_profile_includes_shared_root_skills_dir(self, tmp_path):
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "orchestrator"
+        (profile_home / "skills").mkdir(parents=True)
+        (root / "skills").mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}):
+            from agent.skill_utils import get_all_skills_dirs
+
+            result = get_all_skills_dirs()
+
+        assert result[0] == profile_home / "skills"
+        assert result[1] == (root / "skills").resolve()
+
 
 class TestExternalSkillsInFindAll:
     def test_external_skills_found(self, hermes_home, external_skills_dir):
@@ -155,3 +170,26 @@ class TestExternalSkillView:
             result = json.loads(skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]
+
+    def test_named_profile_skill_view_finds_shared_root_skill(self, tmp_path):
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "orchestrator"
+        local_skills = profile_home / "skills"
+        shared_skill = root / "skills" / "autonomous-ai-agents" / "kanban-flow-orchestrator"
+        local_skills.mkdir(parents=True)
+        shared_skill.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        (shared_skill / "SKILL.md").write_text(
+            "---\nname: kanban-flow-orchestrator\ndescription: shared orchestrator skill\n---\n\n# Shared\n\nUse the shared orchestrator flow.\n"
+        )
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+
+            result = json.loads(skill_view("kanban-flow-orchestrator"))
+
+        assert result["success"] is True
+        assert "shared orchestrator flow" in result["content"]

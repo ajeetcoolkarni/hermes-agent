@@ -425,6 +425,28 @@ class TestBuildPreloadedSkillsPrompt:
         assert loaded == ["present-skill"]
         assert missing == ["missing-skill"]
 
+    def test_named_profile_preload_finds_shared_root_skill(self, tmp_path):
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "orchestrator"
+        profile_skills = profile_home / "skills"
+        shared_skills = root / "skills"
+        profile_skills.mkdir(parents=True)
+        shared_skills.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        _make_skill(shared_skills, "kanban-flow-orchestrator", category="autonomous-ai-agents")
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}),
+            patch("tools.skills_tool.SKILLS_DIR", profile_skills),
+        ):
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["kanban-flow-orchestrator"]
+            )
+
+        assert missing == []
+        assert loaded == ["kanban-flow-orchestrator"]
+        assert "kanban-flow-orchestrator" in prompt
+
 
 class TestBuildSkillInvocationMessage:
     def test_loads_skill_by_stored_path_when_frontmatter_name_differs(self, tmp_path):

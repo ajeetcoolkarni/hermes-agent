@@ -75,10 +75,14 @@ def _hard_stop_config(**overrides) -> dict:
         "tool_loop_guardrails": {
             "warnings_enabled": True,
             "hard_stop_enabled": True,
+            "warn_after": {
+                "terminal_long_lived": 2,
+            },
             "hard_stop_after": {
                 "exact_failure": 2,
                 "same_tool_failure": 8,
                 "idempotent_no_progress": 5,
+                "terminal_long_lived": 3,
             },
         }
     }
@@ -273,3 +277,34 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
         following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
         assert len(following_results) == len(call_ids)
+
+
+def test_long_lived_terminal_launch_loop_halts_before_fourth_identical_retry():
+    agent = _make_agent("terminal", max_iterations=10, config=_hard_stop_config())
+    same_args = {"command": "cd /mnt/win-workspace/nebula-drift && npx vite --host 0.0.0.0 --port 3001"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", json.dumps(same_args), f"t{i}")],
+        )
+        for i in range(1, 10)
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    terminal_result = json.dumps({"output": "", "exit_code": -1, "error": "use background=true", "status": "error"})
+    with (
+        patch("run_agent.handle_function_call", return_value=terminal_result) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("launch the vite dev server")
+
+    assert mock_hfc.call_count == 3
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "terminal_long_lived_repeat_block"
+    assert result["guardrail"]["tool_name"] == "terminal"
+    assert result["guardrail"]["count"] == 3
+    tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
+    assert any("terminal_long_lived_repeat_warning" in content for content in tool_contents)

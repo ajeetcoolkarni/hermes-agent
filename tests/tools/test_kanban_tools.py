@@ -12,6 +12,7 @@ import json
 import os
 
 import pytest
+from tests.kanban_test_helpers import seed_test_profiles
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +72,7 @@ def worker_env(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    seed_test_profiles(home)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
@@ -399,6 +401,139 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_create_rejects_monolithic_same_workspace_worker_task(worker_env):
+    from tools import kanban_tools as kt
+    from pathlib import Path
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "worker").mkdir(parents=True, exist_ok=True)
+
+    out = kt._handle_create({
+        "title": "AAA full overhaul implementation",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/mnt/win-workspace/nebula-drift",
+        "body": (
+            "Do a full overhaul covering visuals, gameplay, audio, browser validation, "
+            "and backend integration in one pass."
+        ),
+    })
+    err = json.loads(out).get("error") or ""
+    assert "MONOLITHIC IMPLEMENTATION GUARD" in err
+
+
+def test_create_allows_same_workspace_worker_task_with_explicit_phase_boundary(worker_env):
+    from tools import kanban_tools as kt
+    from pathlib import Path
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "worker").mkdir(parents=True, exist_ok=True)
+
+    out = kt._handle_create({
+        "title": "Phase A — core integration",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/mnt/win-workspace/nebula-drift",
+        "body": (
+            "This phase covers visuals and gameplay integration only. "
+            "PHASE BOUNDARY: Out of scope for this phase: audio polish and validation. "
+            "Next phase handles browser validation."
+        ),
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+
+
+def test_create_allows_structured_phase_metadata_without_text_markers(worker_env):
+    from tools import kanban_tools as kt
+    from pathlib import Path
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "worker").mkdir(parents=True, exist_ok=True)
+
+    out = kt._handle_create({
+        "title": "Core integration",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/mnt/win-workspace/nebula-drift",
+        "phase_name": "core integration",
+        "phase_index": 1,
+        "phase_total": 3,
+        "body": "Implement visuals, gameplay, and backend scaffolding for this bounded phase only.",
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+
+    shown = json.loads(kt._handle_show({"task_id": data["task_id"]}))
+    assert shown["task"]["phase_name"] == "core integration"
+    assert shown["task"]["phase_index"] == 1
+    assert shown["task"]["phase_total"] == 3
+
+
+def test_create_rejects_incomplete_structured_phase_metadata(worker_env):
+    from tools import kanban_tools as kt
+    from pathlib import Path
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "worker").mkdir(parents=True, exist_ok=True)
+
+    out = kt._handle_create({
+        "title": "Core integration",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/mnt/win-workspace/nebula-drift",
+        "phase_name": "core integration",
+        "body": "Implement broad scoped work.",
+    })
+    err = json.loads(out).get("error") or ""
+    assert "phase_index" in err
+
+
+def test_create_rejects_same_workspace_sibling_without_parent(worker_env):
+    from tools import kanban_tools as kt
+    from pathlib import Path
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "worker").mkdir(parents=True, exist_ok=True)
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "reviewer").mkdir(parents=True, exist_ok=True)
+
+    first = json.loads(kt._handle_create({
+        "title": "First task",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/tmp/shared-workspace",
+        "body": "Phase A only. PHASE BOUNDARY: next task handles review.",
+    }))
+    assert first["ok"] is True
+
+    second = json.loads(kt._handle_create({
+        "title": "Sibling task",
+        "assignee": "reviewer",
+        "workspace_kind": "dir",
+        "workspace_path": "/tmp/shared-workspace",
+        "body": "Review the same workspace in parallel.",
+    }))
+    err = second.get("error") or ""
+    assert "PIPELINE GUARD — BLOCKED" in err
+    assert first["task_id"] in err
+
+
+def test_create_allows_same_workspace_child_when_parented(worker_env):
+    from tools import kanban_tools as kt
+    from pathlib import Path
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "worker").mkdir(parents=True, exist_ok=True)
+    Path(os.environ["HERMES_HOME"]).joinpath("profiles", "reviewer").mkdir(parents=True, exist_ok=True)
+
+    first = json.loads(kt._handle_create({
+        "title": "First task",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/tmp/shared-workspace",
+        "body": "Phase A only. PHASE BOUNDARY: next task handles review.",
+    }))
+    assert first["ok"] is True
+
+    second = json.loads(kt._handle_create({
+        "title": "Child review",
+        "assignee": "reviewer",
+        "workspace_kind": "dir",
+        "workspace_path": "/tmp/shared-workspace",
+        "parents": [first["task_id"]],
+        "body": "Review after implementation completes.",
+    }))
+    assert second["ok"] is True
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -557,6 +692,9 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_create" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
+    # Rejected-review root-cause guidance
+    assert "approved=false" in prompt
+    assert "automatically rewire" in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):

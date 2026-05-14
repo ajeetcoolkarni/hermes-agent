@@ -43,6 +43,8 @@ def test_default_config_is_soft_warning_only_with_hard_stop_disabled():
     assert cfg.exact_failure_block_after == 5
     assert cfg.same_tool_failure_halt_after == 8
     assert cfg.no_progress_block_after == 5
+    assert cfg.terminal_long_lived_warn_after == 2
+    assert cfg.terminal_long_lived_block_after == 3
 
 
 def test_config_parses_nested_warn_and_hard_stop_thresholds():
@@ -71,6 +73,35 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.exact_failure_block_after == 6
     assert cfg.same_tool_failure_halt_after == 7
     assert cfg.no_progress_block_after == 8
+
+
+def test_terminal_long_lived_repeat_warns_then_blocks_even_with_soft_global_config():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=False,
+            terminal_long_lived_warn_after=2,
+            terminal_long_lived_block_after=3,
+        )
+    )
+    args = {"command": "cd /repo && npx vite --host 0.0.0.0 --port 3001"}
+
+    first = controller.after_call("terminal", args, '{"exit_code":1,"error":"bad launch"}', failed=True)
+    second = controller.after_call("terminal", args, '{"exit_code":1,"error":"bad launch"}', failed=True)
+    assert first.action == "allow"
+    assert second.action == "warn"
+    assert second.code == "terminal_long_lived_repeat_warning"
+
+    blocked = controller.before_call("terminal", args)
+    assert blocked.action == "allow"
+
+    third = controller.after_call("terminal", args, '{"exit_code":1,"error":"bad launch"}', failed=True)
+    assert third.action == "warn"
+    assert third.code == "terminal_long_lived_repeat_warning"
+
+    blocked = controller.before_call("terminal", args)
+    assert blocked.action == "block"
+    assert blocked.code == "terminal_long_lived_repeat_block"
+    assert blocked.count == 3
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():

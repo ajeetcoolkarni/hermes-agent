@@ -170,6 +170,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
                     "result": t.result,
+                    "phase_name": t.phase_name,
+                    "phase_index": t.phase_index,
+                    "phase_total": t.phase_total,
                     "current_run_id": t.current_run_id,
                 }
 
@@ -407,6 +410,9 @@ def _handle_create(args: dict, **kw) -> str:
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
+    phase_name = args.get("phase_name")
+    phase_index = args.get("phase_index")
+    phase_total = args.get("phase_total")
     triage = bool(args.get("triage"))
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
@@ -496,6 +502,13 @@ def _handle_create(args: dict, **kw) -> str:
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
+                ),
+                phase_name=(str(phase_name).strip() if phase_name is not None else None),
+                phase_index=(
+                    int(phase_index) if phase_index is not None else None
+                ),
+                phase_total=(
+                    int(phase_total) if phase_total is not None else None
                 ),
                 skills=skills,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
@@ -805,6 +818,25 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "phase_name": {
+                "type": "string",
+                "description": (
+                    "Optional structured phase label for same-workspace sequential work "
+                    "(for example 'core integration' or 'polish')."
+                ),
+            },
+            "phase_index": {
+                "type": "integer",
+                "description": (
+                    "Optional structured phase number. Prefer this over relying only on title/body wording."
+                ),
+            },
+            "phase_total": {
+                "type": "integer",
+                "description": (
+                    "Optional total number of planned phases. Must be >= phase_index when set."
                 ),
             },
             "triage": {

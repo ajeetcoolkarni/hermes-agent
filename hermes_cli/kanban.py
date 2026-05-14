@@ -69,6 +69,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "started_at": t.started_at,
         "completed_at": t.completed_at,
         "result": t.result,
+        "phase_name": t.phase_name,
+        "phase_index": t.phase_index,
+        "phase_total": t.phase_total,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
     }
@@ -268,6 +271,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="scratch | worktree | dir:<path> (default: scratch)")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_create.add_argument("--phase-name", default=None,
+                          help="Structured phase label for same-workspace sequential work")
+    p_create.add_argument("--phase-index", type=int, default=None,
+                          help="Structured phase number (preferred over title/body-only phasing)")
+    p_create.add_argument("--phase-total", type=int, default=None,
+                          help="Optional total number of planned phases (must be >= phase-index)")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
@@ -1056,6 +1065,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
+            phase_name=getattr(args, "phase_name", None),
+            phase_index=getattr(args, "phase_index", None),
+            phase_total=getattr(args, "phase_total", None),
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
         )

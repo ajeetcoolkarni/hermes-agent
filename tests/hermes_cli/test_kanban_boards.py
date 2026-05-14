@@ -29,6 +29,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from tests.kanban_test_helpers import seed_test_profiles
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,7 @@ def fresh_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes_home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    seed_test_profiles(home)
     for var in (
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_WORKSPACES_ROOT",
@@ -413,6 +415,11 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
     env["PYTHONPATH"] = str(_WORKTREE)
     if env_extra:
         env.update(env_extra)
+    if env.get("HERMES_HOME"):
+        for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD"):
+            env.pop(var, None)
+        env.setdefault("HERMES_KANBAN_HOME", env["HERMES_HOME"])
+        seed_test_profiles(Path(env["HERMES_HOME"]))
     return subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "kanban"] + args,
         env=env,

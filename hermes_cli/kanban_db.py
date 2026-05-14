@@ -119,6 +119,8 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 # All *other* profiles (fallback / remote) are capped at MAX_CONCURRENT_FALLBACK.
 _LOCAL_PROFILES          = {"planner", "worker"}
 _MAX_CONCURRENT_FALLBACK = 2
+_IMPLEMENTER_ASSIGNEE_PREFIXES = ("worker",)
+_IMPLEMENTER_ASSIGNEES = {"asset-builder"}
 
 _NORMALIZE_WS_RE = re.compile(r"[\\/:]+")
 
@@ -650,6 +652,9 @@ class Task:
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    phase_name: Optional[str] = None
+    phase_index: Optional[int] = None
+    phase_total: Optional[int] = None
     # Force-loaded skills for the worker on this task (appended to the
     # dispatcher's built-in `kanban-worker` via --skills). Stored as a
     # JSON array of skill names. None = use only the defaults; empty
@@ -722,6 +727,15 @@ class Task:
             ),
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
+            ),
+            phase_name=(
+                row["phase_name"] if "phase_name" in keys else None
+            ),
+            phase_index=(
+                row["phase_index"] if "phase_index" in keys else None
+            ),
+            phase_total=(
+                row["phase_total"] if "phase_total" in keys else None
             ),
             skills=skills_value,
             max_retries=(
@@ -844,6 +858,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    -- Structured phasing metadata for sequential same-workspace work.
+    -- These are the canonical guard inputs; text markers in the body/title
+    -- are only a fallback for older callers.
+    phase_name           TEXT,
+    phase_index          INTEGER,
+    phase_total          INTEGER,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Appended to the dispatcher's built-in `--skills kanban-worker`.
     -- NULL or empty array = no extras.
@@ -1079,6 +1099,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN workflow_template_id TEXT")
     if "current_step_key" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN current_step_key TEXT")
+    if "phase_name" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN phase_name TEXT")
+    if "phase_index" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN phase_index INTEGER")
+    if "phase_total" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN phase_total INTEGER")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker (additive to the built-in `kanban-worker`). NULL is fine
@@ -1232,6 +1258,519 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_worker_skill_name(name: Optional[str]) -> Optional[str]:
+    """Normalize a worker skill identifier to the bare skill name."""
+    if not name:
+        return None
+    normalized = str(name).strip()
+    if not normalized:
+        return None
+    if ":" in normalized:
+        normalized = normalized.split(":")[-1]
+    return normalized or None
+
+
+def _auto_specialist_skill_for_task(task: "Task") -> Optional[str]:
+    """Return an assignee-matched specialist skill that should auto-load.
+
+    Root cause: kanban-dispatched workers always received ``kanban-worker`` but
+    did not automatically receive the specialist skill whose instructions define
+    that assignee's role. For profiles like ``asset-builder`` this meant the
+    worker launched without the premium asset-sourcing workflow unless the task
+    author also remembered to duplicate the skill name into ``task.skills``.
+
+    When a task assignee has an installed, enabled, platform-compatible skill
+    with the same name, auto-preload it. This keeps specialist profile routing
+    and specialist skill loading aligned by default while remaining additive to
+    explicit per-task ``skills=[...]`` overrides.
+    """
+    assignee_skill = _normalize_worker_skill_name(task.assignee)
+    if not assignee_skill or assignee_skill == "kanban-worker":
+        return None
+
+    try:
+        from hermes_constants import get_hermes_home
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from tools.skills_tool import _parse_frontmatter, _is_skill_disabled, skill_matches_platform
+    except Exception:
+        return None
+
+    search_roots: list[Path] = []
+    local_skills_dir = get_hermes_home() / "skills"
+    if local_skills_dir.exists():
+        search_roots.append(local_skills_dir)
+    try:
+        search_roots.extend(get_external_skills_dirs())
+    except Exception:
+        pass
+
+    for search_dir in search_roots:
+        try:
+            skill_files = iter_skill_index_files(search_dir, "SKILL.md")
+        except Exception:
+            continue
+        for skill_md in skill_files:
+            try:
+                content = skill_md.read_text(encoding="utf-8")
+                frontmatter, _ = _parse_frontmatter(content)
+            except Exception:
+                continue
+
+            resolved_name = _normalize_worker_skill_name(
+                frontmatter.get("name") or skill_md.parent.name
+            )
+            if resolved_name != assignee_skill:
+                continue
+            if not skill_matches_platform(frontmatter):
+                return None
+            if _is_skill_disabled(resolved_name):
+                return None
+            return resolved_name
+
+    return None
+
+
+_MONOLITHIC_SCOPE_MARKERS = (
+    "full overhaul",
+    "complete overhaul",
+    "full rewrite",
+    "complete rewrite",
+    "entire app",
+    "whole app",
+    "entire project",
+    "end-to-end",
+    "aaa",
+    "premium polish",
+)
+
+_PHASE_DECLARATION_MARKERS = (
+    "phase boundary",
+    "this phase",
+    "next phase",
+    "out of scope for this phase",
+    "budget awareness",
+    "sequential phase",
+)
+
+_MONOLITHIC_DOMAIN_KEYWORDS = {
+    "ui_visual": (
+        "frontend",
+        "ui",
+        "ux",
+        "css",
+        "styling",
+        "layout",
+        "render",
+        "rendering",
+        "visual",
+        "visuals",
+    ),
+    "backend_data": (
+        "backend",
+        "api",
+        "endpoint",
+        "database",
+        "schema",
+        "migration",
+        "auth",
+        "service",
+    ),
+    "assets_content": (
+        "asset",
+        "assets",
+        "model",
+        "texture",
+        "sprite",
+        "icon",
+        "art",
+    ),
+    "gameplay_logic": (
+        "gameplay",
+        "physics",
+        "mechanic",
+        "engine",
+        "balance",
+    ),
+    "audio_media": (
+        "audio",
+        "music",
+        "sound",
+        "voice",
+        "narration",
+    ),
+    "infra_ops": (
+        "deploy",
+        "deployment",
+        "docker",
+        "ci",
+        "infra",
+        "infrastructure",
+        "configuration",
+        "config",
+    ),
+    "validation_qa": (
+        "test",
+        "tests",
+        "browser",
+        "e2e",
+        "qa",
+        "validate",
+        "validation",
+        "smoke",
+        "review",
+    ),
+}
+
+
+def _task_text_for_guard(title: Optional[str], body: Optional[str]) -> str:
+    return f"{title or ''}\n{body or ''}".lower()
+
+
+def _has_explicit_phase_declaration(text: str) -> bool:
+    if any(marker in text for marker in _PHASE_DECLARATION_MARKERS):
+        return True
+    return bool(re.search(r"\b(?:phase|stage|part)\s+(?:[0-9]+|[a-z])\b", text))
+
+
+def _normalize_phase_metadata(
+    *,
+    phase_name: Optional[str],
+    phase_index: Optional[int],
+    phase_total: Optional[int],
+) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    name = str(phase_name).strip() if phase_name is not None else None
+    if name == "":
+        name = None
+
+    index = int(phase_index) if phase_index is not None else None
+    total = int(phase_total) if phase_total is not None else None
+
+    if index is None and total is None and name is None:
+        return (None, None, None)
+
+    if index is None:
+        raise ValueError(
+            "structured phase metadata requires phase_index when any phase_* field is provided"
+        )
+    if index < 1:
+        raise ValueError("phase_index must be >= 1")
+    if total is not None:
+        if total < 1:
+            raise ValueError("phase_total must be >= 1")
+        if total < index:
+            raise ValueError("phase_total must be >= phase_index")
+    if name is None:
+        name = f"Phase {index}"
+    return (name, index, total)
+
+
+def _domain_hits_for_guard(text: str) -> list[str]:
+    hits: list[str] = []
+    for label, keywords in _MONOLITHIC_DOMAIN_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            hits.append(label)
+    return hits
+
+
+def _same_workspace_active_guard_reason(
+    conn: sqlite3.Connection,
+    *,
+    parents: Iterable[str],
+    assignee: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> Optional[str]:
+    """Block sibling creates that target an already-active mutable workspace.
+
+    This is the root-cause guard for every creation path that ultimately calls
+    ``create_task``: CLI, dashboard API, tool wrappers, and helper scripts.
+    A new task may target the same mutable workspace only when it explicitly
+    chains itself behind at least one already-active same-workspace task via
+    ``parents=[existing_task_id]``.
+    """
+    if workspace_kind not in {"dir", "worktree"} or not workspace_path:
+        return None
+
+    target_key = _normalize_workspace(workspace_path)
+    if not target_key:
+        return None
+
+    rows = conn.execute(
+        """
+        SELECT id, title, status, assignee, workspace_kind, workspace_path
+        FROM tasks
+        WHERE status IN ('todo', 'running', 'ready', 'blocked')
+          AND workspace_kind IN ('dir', 'worktree')
+          AND workspace_path IS NOT NULL
+        ORDER BY created_at ASC
+        """
+    ).fetchall()
+    existing = [
+        r for r in rows
+        if _normalize_workspace(r["workspace_path"]) == target_key
+    ]
+    if not existing:
+        return None
+
+    parent_set = {p for p in parents if p}
+    existing_ids = {r["id"] for r in existing}
+    if existing_ids & parent_set:
+        return None
+
+    existing_list = ", ".join(
+        f"{r['id']}({r['status']}/{r['assignee'] or '-'})" for r in existing
+    )
+    return (
+        "PIPELINE GUARD — BLOCKED: "
+        f"task targets mutable workspace '{workspace_path}' with assignee='{assignee or '-'}', "
+        f"but there are already active tasks ({existing_list}) on the SAME workspace. "
+        "To enforce sequential flow, set parents=[existing_task_id] so this task waits "
+        "for prior work to finish. If you truly need parallel access, use different workspaces."
+    )
+
+
+def _is_implementer_assignee(assignee: Optional[str]) -> bool:
+    if not assignee:
+        return False
+    name = str(assignee).strip().lower()
+    return any(name.startswith(prefix) for prefix in _IMPLEMENTER_ASSIGNEE_PREFIXES) or name in _IMPLEMENTER_ASSIGNEES
+
+
+def _task_lineage_row(conn: sqlite3.Connection, task_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, title, assignee, status, workspace_kind, workspace_path
+        FROM tasks
+        WHERE id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+
+
+def _iter_descendant_rows(conn: sqlite3.Connection, task_id: str) -> Iterable[sqlite3.Row]:
+    seen: set[str] = set()
+    stack = list(child_ids(conn, task_id))
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        row = _task_lineage_row(conn, current)
+        if row is None:
+            continue
+        yield row
+        stack.extend(child_ids(conn, current))
+
+
+def _same_workspace_lineage_rows(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_key: Optional[str],
+) -> list[sqlite3.Row]:
+    if not workspace_key:
+        return []
+    rows: list[sqlite3.Row] = []
+    for row in _iter_descendant_rows(conn, task_id):
+        if _normalize_workspace(row["workspace_path"]) == workspace_key:
+            rows.append(row)
+    return rows
+
+
+def _reviewer_parented_worker_guard_reason(
+    conn: sqlite3.Connection,
+    *,
+    parents: Iterable[str],
+    assignee: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> Optional[str]:
+    """Reject worker remediation cards that parent directly to a reviewer."""
+    if not _is_implementer_assignee(assignee):
+        return None
+    if workspace_kind not in {"dir", "worktree"} or not workspace_path:
+        return None
+    workspace_key = _normalize_workspace(workspace_path)
+    if not workspace_key:
+        return None
+
+    reviewer_parents: list[sqlite3.Row] = []
+    upstream_workers: list[sqlite3.Row] = []
+    for pid in parents:
+        row = _task_lineage_row(conn, pid)
+        if row is None:
+            continue
+        if _normalize_workspace(row["workspace_path"]) != workspace_key:
+            continue
+        if row["assignee"] == "reviewer":
+            reviewer_parents.append(row)
+            for upstream_id in parent_ids(conn, row["id"]):
+                upstream = _task_lineage_row(conn, upstream_id)
+                if upstream is None:
+                    continue
+                if _normalize_workspace(upstream["workspace_path"]) != workspace_key:
+                    continue
+                if _is_implementer_assignee(upstream["assignee"]):
+                    upstream_workers.append(upstream)
+    if not reviewer_parents:
+        return None
+
+    reviewer_list = ", ".join(sorted({r["id"] for r in reviewer_parents}))
+    upstream_hint = ""
+    if upstream_workers:
+        worker_list = ", ".join(sorted({r["id"] for r in upstream_workers}))
+        upstream_hint = (
+            f" Parent remediation to the reviewed worker chain ({worker_list}), not reviewer lineage {reviewer_list}."
+        )
+    return (
+        "REVIEWER LINEAGE GUARD — BLOCKED: "
+        f"same-workspace implementer task assignee='{assignee}' cannot parent directly to reviewer task(s) {reviewer_list} "
+        f"on mutable workspace '{workspace_path}'. Reviewer rejection must extend the worker chain, not create a reviewer→worker loop."
+        f"{upstream_hint}"
+    )
+
+
+def _reviewer_creation_guard_reason(
+    conn: sqlite3.Connection,
+    *,
+    parents: Iterable[str],
+    assignee: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> Optional[str]:
+    """Enforce single-reviewer terminal-worker lineage on mutable workspaces."""
+    if assignee != "reviewer":
+        return None
+    if workspace_kind not in {"dir", "worktree"} or not workspace_path:
+        return None
+    workspace_key = _normalize_workspace(workspace_path)
+    if not workspace_key:
+        return None
+
+    direct_same_workspace_worker_parents: list[sqlite3.Row] = []
+    same_workspace_reviewer_parents: list[sqlite3.Row] = []
+    for pid in parents:
+        row = _task_lineage_row(conn, pid)
+        if row is None:
+            continue
+        if _normalize_workspace(row["workspace_path"]) != workspace_key:
+            continue
+        if _is_implementer_assignee(row["assignee"]):
+            direct_same_workspace_worker_parents.append(row)
+        elif row["assignee"] == "reviewer":
+            same_workspace_reviewer_parents.append(row)
+
+    if same_workspace_reviewer_parents:
+        reviewer_list = ", ".join(sorted({r["id"] for r in same_workspace_reviewer_parents}))
+        return (
+            "REVIEWER LINEAGE GUARD — BLOCKED: "
+            f"reviewer task on mutable workspace '{workspace_path}' cannot parent to reviewer task(s) {reviewer_list}. "
+            "Only the terminal worker in the chain may create the sole reviewer task."
+        )
+    if len(direct_same_workspace_worker_parents) != 1:
+        return (
+            "REVIEWER LINEAGE GUARD — BLOCKED: "
+            f"reviewer task on mutable workspace '{workspace_path}' must parent to exactly one terminal worker in the SAME workspace. "
+            "Create the reviewer only from the last worker in the sequential chain."
+        )
+
+    worker_parent = direct_same_workspace_worker_parents[0]
+    descendants = _same_workspace_lineage_rows(
+        conn,
+        worker_parent["id"],
+        workspace_key=workspace_key,
+    )
+    worker_descendants = [r for r in descendants if _is_implementer_assignee(r["assignee"])]
+    if worker_descendants:
+        unfinished_worker_descendants = [
+            r for r in worker_descendants if r["status"] not in {"done", "archived"}
+        ]
+        existing = ", ".join(
+            f"{r['id']}({r['status']}/{r['assignee'] or '-'})"
+            for r in (unfinished_worker_descendants or worker_descendants)
+        )
+        if unfinished_worker_descendants:
+            return (
+                "REVIEWER LINEAGE GUARD — BLOCKED: "
+                f"worker {worker_parent['id']} is not terminal for workspace '{workspace_path}' because unfinished worker descendants already exist ({existing}). "
+                "Finish the downstream worker chain first; reviewer creation is only allowed after all worker descendants complete."
+            )
+        return (
+            "REVIEWER LINEAGE GUARD — BLOCKED: "
+            f"worker {worker_parent['id']} is not the terminal worker for workspace '{workspace_path}' because downstream worker descendants already exist ({existing}). "
+            "Only the last worker in the sequential chain may create the reviewer task."
+        )
+
+    reviewer_descendants = [
+        r for r in descendants
+        if r["assignee"] == "reviewer" and r["status"] != "archived"
+    ]
+    if reviewer_descendants:
+        existing = ", ".join(
+            f"{r['id']}({r['status']}/reviewer)"
+            for r in reviewer_descendants
+        )
+        return (
+            "REVIEWER LINEAGE GUARD — BLOCKED: "
+            f"worker {worker_parent['id']} on workspace '{workspace_path}' already has a reviewer lineage ({existing}). "
+            "Allow only one reviewer lineage for the same workspace chain."
+        )
+    return None
+
+
+def _monolithic_same_workspace_guard_reason(
+    *,
+    title: Optional[str],
+    body: Optional[str],
+    assignee: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    phase_name: Optional[str] = None,
+    phase_index: Optional[int] = None,
+    phase_total: Optional[int] = None,
+) -> Optional[str]:
+    """Return a blocking reason for oversized same-workspace implementation cards.
+
+    The guard is intentionally narrow: only mutable workspaces (dir/worktree)
+    assigned to worker profiles are inspected. Small focused implementation
+    cards pass; broad same-workspace worker cards must declare an explicit
+    phase/stage boundary so the orchestrator cannot hide an entire rewrite
+    inside one task.
+    """
+
+    if workspace_kind not in {"dir", "worktree"} or not workspace_path:
+        return None
+    if not assignee or not str(assignee).startswith("worker"):
+        return None
+    if phase_index is not None:
+        return None
+
+    text = _task_text_for_guard(title, body)
+    if _has_explicit_phase_declaration(text):
+        return None
+
+    scope_hits = [marker for marker in _MONOLITHIC_SCOPE_MARKERS if marker in text]
+    domain_hits = _domain_hits_for_guard(text)
+
+    looks_monolithic = (
+        len(domain_hits) >= 3
+        or (bool(scope_hits) and len(domain_hits) >= 2)
+    )
+    if not looks_monolithic:
+        return None
+
+    scope_summary = ", ".join(scope_hits[:3]) or "broad multi-domain scope"
+    domain_summary = ", ".join(domain_hits[:4])
+    return (
+        "MONOLITHIC IMPLEMENTATION GUARD — BLOCKED: "
+        f"task targets mutable workspace '{workspace_path}' with assignee='{assignee}' "
+        f"and appears to combine multiple implementation domains ({domain_summary}) "
+        f"under broad scope language ({scope_summary}) without an explicit phase/stage boundary. "
+        "Split it into sequential Phase A / Phase B / Phase C tasks and state the phase in the title/body "
+        "(for example: 'Phase A — core integration', 'Out of scope for this phase', 'Next phase handles validation')."
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -1247,6 +1786,9 @@ def create_task(
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
+    phase_name: Optional[str] = None,
+    phase_index: Optional[int] = None,
+    phase_total: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
 ) -> str:
@@ -1273,12 +1815,26 @@ def create_task(
     ``kanban-worker``. Use this to pin a task to a specialist skill
     (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``phase_name`` / ``phase_index`` / ``phase_total`` are structured
+    phase metadata for same-workspace implementation chains. The runtime
+    monolithic-worker guard treats these fields as the canonical signal
+    that the task is one bounded phase of a larger sequence.
     """
     assignee = _canonical_assignee(assignee)
+    phase_name, phase_index, phase_total = _normalize_phase_metadata(
+        phase_name=phase_name,
+        phase_index=phase_index,
+        phase_total=phase_total,
+    )
     if assignee is not None:
-        from hermes_cli.profiles import get_profile_dir, _get_profiles_root
-        if not get_profile_dir(assignee).is_dir():
-            available = sorted(p.name for p in _get_profiles_root().iterdir() if p.is_dir())
+        from hermes_cli.profiles import profile_exists, _get_profiles_root
+        if not profile_exists(assignee):
+            profiles_root = _get_profiles_root()
+            available = (
+                sorted(p.name for p in profiles_root.iterdir() if p.is_dir())
+                if profiles_root.is_dir() else []
+            )
             raise ValueError(
                 f"Cannot create task: profile '{assignee}' does not exist. "
                 f"Available profiles: {', '.join(available) or '[none]'}. "
@@ -1292,6 +1848,48 @@ def create_task(
             f"got {workspace_kind!r}"
         )
     parents = tuple(p for p in parents if p)
+    reviewer_parented_worker_guard = _reviewer_parented_worker_guard_reason(
+        conn,
+        parents=parents,
+        assignee=assignee,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    if reviewer_parented_worker_guard:
+        raise ValueError(reviewer_parented_worker_guard)
+
+    reviewer_creation_guard = _reviewer_creation_guard_reason(
+        conn,
+        parents=parents,
+        assignee=assignee,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    if reviewer_creation_guard:
+        raise ValueError(reviewer_creation_guard)
+
+    same_workspace_guard = _same_workspace_active_guard_reason(
+        conn,
+        parents=parents,
+        assignee=assignee,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+    )
+    if same_workspace_guard:
+        raise ValueError(same_workspace_guard)
+
+    monolithic_guard = _monolithic_same_workspace_guard_reason(
+        title=title,
+        body=body,
+        assignee=assignee,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        phase_name=phase_name,
+        phase_index=phase_index,
+        phase_total=phase_total,
+    )
+    if monolithic_guard:
+        raise ValueError(monolithic_guard)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -1356,14 +1954,16 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're blocked.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
+                        # If any parent is not yet done, the child stays todo;
+                        # blocked is reserved for explicit operator/dispatcher
+                        # blocks (workspace collision, assignee cap, user block).
                         if any(r["status"] != "done" for r in rows):
-                            initial_status = "blocked"
+                            initial_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -1376,9 +1976,10 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        tenant, idempotency_key, max_runtime_seconds, skills,
-                        max_retries
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        tenant, idempotency_key, max_runtime_seconds,
+                        phase_name, phase_index, phase_total,
+                        skills, max_retries
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -1394,6 +1995,9 @@ def create_task(
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds else None,
+                        phase_name,
+                        phase_index,
+                        phase_total,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                     ),
@@ -1412,6 +2016,9 @@ def create_task(
                         "status": initial_status,
                         "parents": list(parents),
                         "tenant": tenant,
+                        "phase_name": phase_name,
+                        "phase_index": phase_index,
+                        "phase_total": phase_total,
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
@@ -2271,6 +2878,93 @@ def _scan_prose_for_phantom_ids(
     return [m for m in unique if m not in existing]
 
 
+def _rewire_downstream_children_on_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict],
+    replacement_parents: Iterable[str],
+) -> list[dict[str, str]]:
+    """When a gate completes with ``approved=false``, make downstream
+    children wait on the newly spawned remediation path too.
+
+    This closes the kernel-level hole where a reviewer could correctly
+    finish with ``metadata={"approved": false}`` and ``created_cards=[...]``
+    yet pre-existing downstream children (typically docs/finalization
+    tasks) would still unblock immediately because their only parent was
+    the now-``done`` rejected gate.
+
+    For every existing child of ``task_id`` that is *not* one of the
+    replacement cards, add each verified replacement card as an
+    additional parent. The child therefore remains blocked until the
+    remediation path completes. Existing links are left intact.
+    """
+    if not isinstance(metadata, dict) or metadata.get("approved") is not False:
+        return []
+
+    # Dedupe while preserving order.
+    replacements: list[str] = []
+    seen_replacements: set[str] = set()
+    for raw in replacement_parents or ():
+        rid = str(raw).strip()
+        if not rid or rid in seen_replacements:
+            continue
+        seen_replacements.add(rid)
+        replacements.append(rid)
+    if not replacements:
+        return []
+
+    downstream_children = [
+        cid for cid in child_ids(conn, task_id)
+        if cid not in seen_replacements
+    ]
+    if not downstream_children:
+        return []
+
+    parent_status_rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE id IN ("
+        + ",".join("?" * len(replacements))
+        + ")",
+        tuple(replacements),
+    ).fetchall()
+    parent_status = {r["id"]: r["status"] for r in parent_status_rows}
+
+    rewired: list[dict[str, str]] = []
+    for parent_id in replacements:
+        if parent_id not in parent_status:
+            continue
+        for child_id in downstream_children:
+            if parent_id == child_id or _would_cycle(conn, parent_id, child_id):
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (parent_id, child_id),
+            )
+            if cur.rowcount <= 0:
+                continue
+            # Mirror link_tasks(): if a new non-done parent is attached to a
+            # ready child, demote it so the dispatcher can't claim it ahead of
+            # the remediation path.
+            if parent_status[parent_id] != "done":
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+            _append_event(
+                conn,
+                child_id,
+                "linked",
+                {
+                    "parent": parent_id,
+                    "child": child_id,
+                    "source": "rejection_rewire",
+                    "gate_task": task_id,
+                },
+            )
+            rewired.append({"parent": parent_id, "child": child_id})
+    return rewired
+
+
 class HallucinatedCardsError(ValueError):
     """Raised by ``complete_task`` when ``created_cards`` contains ids
     that don't exist or weren't created by the completing worker.
@@ -2299,11 +2993,15 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|blocked|triage -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    a claim/start/complete sequence. ``triage`` is also accepted for
+    operator repair flows where a reviewer semantically finished its gate
+    (for example: rejected with remediation already spawned) but was later
+    moved to triage via dashboard/direct status edits and now needs a clean
+    terminal completion recorded.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -2368,7 +3066,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'triage')
                 """,
                 (result, now, task_id),
             )
@@ -2419,6 +3117,14 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        rewired_children = _rewire_downstream_children_on_rejection(
+            conn,
+            task_id,
+            metadata=metadata,
+            replacement_parents=verified_cards,
+        )
+        if rewired_children:
+            completed_payload["rewired_children"] = rewired_children
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -3911,36 +4617,31 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
-    cmd = [
-        "hermes",
-        "-p", profile_arg,
-        # Auto-load the kanban-worker skill so every dispatched worker
-        # has the pattern library (good summary/metadata shapes, retry
-        # diagnostics, block-reason examples) in its context, even if
-        # the profile hasn't wired it into skills config. The MANDATORY
-        # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
-        # this skill is the deeper reference. Users can point a profile
-        # at a different/additional skill via config if they want —
-        # --skills is additive to the profile's default skill set.
-        "--skills", "kanban-worker",
-    ]
-    # Per-task force-loaded skills. Each name goes in its own
-    # `--skills X` pair rather than a single comma-joined arg: the CLI
-    # accepts both forms (action='append' + comma-split), but
-    # per-name pairs are easier to read in `ps` output and avoid any
-    # quoting ambiguity if a skill name ever contains unusual chars.
-    # Dedupe against the built-in so we don't double-load kanban-worker
-    # if a task author asks for it explicitly.
+    preload_skills: list[str] = ["kanban-worker"]
+    specialist_skill = _auto_specialist_skill_for_task(task)
+    if specialist_skill:
+        preload_skills.append(specialist_skill)
     if task.skills:
         for sk in task.skills:
-            # Normalize: strip any "category:" prefix that may have been stored
-            # in the DB.  The CLI --skills flag and skill_view() both expect
-            # bare names (e.g. "kanban-worker", not "devops:kanban-worker").
-            if not sk:
-                continue
-            normalized = sk.split(":")[-1] if ":" in str(sk) else str(sk)
-            if normalized != "kanban-worker":
-                cmd.extend(["--skills", normalized])
+            normalized = _normalize_worker_skill_name(sk)
+            if normalized:
+                preload_skills.append(normalized)
+
+    # Preserve order while deduping. Every dispatched worker gets
+    # kanban-worker; specialist assignees (e.g. asset-builder) then
+    # auto-load their same-named skill when it exists; explicit task.skills
+    # remain additive without producing duplicate argv pairs.
+    deduped_preload_skills: list[str] = []
+    seen_preload_skills: set[str] = set()
+    for skill_name in preload_skills:
+        if not skill_name or skill_name in seen_preload_skills:
+            continue
+        seen_preload_skills.add(skill_name)
+        deduped_preload_skills.append(skill_name)
+
+    cmd = ["hermes", "-p", profile_arg]
+    for skill_name in deduped_preload_skills:
+        cmd.extend(["--skills", skill_name])
     cmd.extend([
         "chat",
         "-q", prompt,
@@ -4087,6 +4788,13 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.phase_index is not None:
+        phase_line = f"Phase: {task.phase_name or f'Phase {task.phase_index}'}"
+        if task.phase_total is not None:
+            phase_line += f" ({task.phase_index}/{task.phase_total})"
+        else:
+            phase_line += f" ({task.phase_index})"
+        lines.append(phase_line)
     lines.append("")
 
     if task.body and task.body.strip():

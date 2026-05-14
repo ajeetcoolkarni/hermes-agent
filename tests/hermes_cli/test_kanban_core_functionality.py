@@ -24,6 +24,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
+from tests.kanban_test_helpers import seed_test_profiles
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +37,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    seed_test_profiles(home)
     kb.init_db()
     return home
 
@@ -74,6 +76,91 @@ def test_no_idempotency_key_never_collides(kanban_home):
         a = kb.create_task(conn, title="a")
         b = kb.create_task(conn, title="b")
         assert a != b
+    finally:
+        conn.close()
+
+
+def test_create_task_rejects_monolithic_same_workspace_worker_card(kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="MONOLITHIC IMPLEMENTATION GUARD"):
+            kb.create_task(
+                conn,
+                title="Full overhaul implementation",
+                assignee="worker",
+                workspace_kind="dir",
+                workspace_path="/mnt/win-workspace/nebula-drift",
+                body=(
+                    "Handle frontend visuals, backend API wiring, audio, and browser validation "
+                    "for the entire app in one pass."
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def test_create_task_allows_phased_same_workspace_worker_card(kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Phase B — polish",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path="/mnt/win-workspace/nebula-drift",
+            body=(
+                "This phase handles visual polish only. "
+                "PHASE BOUNDARY: Out of scope for this phase: backend changes, audio, browser validation. "
+                "Next phase handles validation."
+            ),
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.title == "Phase B — polish"
+    finally:
+        conn.close()
+
+
+def test_create_task_allows_structured_phase_metadata_without_text_markers(kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Core integration",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path="/mnt/win-workspace/nebula-drift",
+            phase_name="core integration",
+            phase_index=1,
+            phase_total=3,
+            body="Implement visuals, gameplay, and backend scaffolding for this bounded phase only.",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.phase_name == "core integration"
+        assert task.phase_index == 1
+        assert task.phase_total == 3
+    finally:
+        conn.close()
+
+
+def test_create_task_rejects_incomplete_structured_phase_metadata(kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="phase_index"):
+            kb.create_task(
+                conn,
+                title="Core integration",
+                assignee="worker",
+                workspace_kind="dir",
+                workspace_path="/mnt/win-workspace/nebula-drift",
+                phase_name="core integration",
+                body="Broad task body",
+            )
     finally:
         conn.close()
 
@@ -1198,9 +1285,15 @@ def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        # writer has a ready task; on_board_only has a task but no profile dir.
+        # writer has a ready task; inject one board-only assignee directly so
+        # known_assignees still proves it merges disk profiles with names seen
+        # only in the board state.
         kb.create_task(conn, title="a", assignee="writer")
-        kb.create_task(conn, title="b", assignee="on_board_only")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, assignee, created_at) VALUES (?, ?, 'ready', ?, 0)",
+                (kb._new_task_id(), "b", "on_board_only"),
+            )
         data = kb.known_assignees(conn)
     finally:
         conn.close()
@@ -1219,7 +1312,11 @@ def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch):
 def test_cli_assignees_json(kanban_home):
     conn = kb.connect()
     try:
-        kb.create_task(conn, title="x", assignee="someone")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, assignee, created_at) VALUES (?, ?, 'ready', ?, 0)",
+                (kb._new_task_id(), "x", "someone"),
+            )
     finally:
         conn.close()
     out = run_slash("assignees --json")
@@ -2083,6 +2180,7 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
     worktree_root = Path(__file__).resolve().parents[2]
     env = {**os.environ, "HERMES_HOME": str(home),
            "PYTHONPATH": str(worktree_root)}
+    (home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
     r = _sp.run(
         [_sys.executable, "-m", "hermes_cli.main", "kanban",
          "create", "smoke", "--assignee", "worker", "--json"],
@@ -2213,6 +2311,7 @@ def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    seed_test_profiles(home)
 
     # Fresh DB, one task left in 'running' with a claim but no run row.
     # Simulates a pre-runs-era DB.
@@ -2748,6 +2847,112 @@ def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monke
     assert len(worker_pairs) == 1, (
         f"kanban-worker appeared {len(worker_pairs)} times in argv: {cmd}"
     )
+
+
+def test_default_spawn_auto_loads_assignee_matched_specialist_skill(kanban_home, monkeypatch):
+    """If the assignee has a same-named installed skill, auto-load it."""
+    captured = {}
+
+    class FakeProc:
+        pid = 7
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    profile_dir = hermes_home / "profiles" / "asset-builder"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+
+    skill_dir = hermes_home / "skills" / "autonomous-ai-agents" / "asset-builder"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: asset-builder\n"
+        "description: specialist asset sourcing\n"
+        "---\n\n"
+        "# Asset Builder\n",
+        encoding="utf-8",
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="source premium assets",
+            assignee="asset-builder",
+        )
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
+    ]
+    assert skill_names[:2] == ["kanban-worker", "asset-builder"], skill_names
+
+
+def test_default_spawn_skips_assignee_skill_when_disabled(kanban_home, monkeypatch):
+    """Auto-loading respects skills.disabled config."""
+    captured = {}
+
+    class FakeProc:
+        pid = 8
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    hermes_home = Path(os.environ["HERMES_HOME"])
+    profile_dir = hermes_home / "profiles" / "asset-builder"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n  disabled:\n    - asset-builder\n",
+        encoding="utf-8",
+    )
+
+    skill_dir = hermes_home / "skills" / "autonomous-ai-agents" / "asset-builder"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: asset-builder\n"
+        "description: specialist asset sourcing\n"
+        "---\n\n"
+        "# Asset Builder\n",
+        encoding="utf-8",
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="source premium assets",
+            assignee="asset-builder",
+        )
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
+    ]
+    assert skill_names == ["kanban-worker"], skill_names
 
 
 def test_cli_create_skill_flag_repeatable(kanban_home):
@@ -3416,6 +3621,331 @@ def test_complete_accepts_cross_worker_card_when_linked_as_child(kanban_home):
         ).fetchone()
         payload = _json.loads(row["payload"])
         assert other in payload.get("verified_cards", [])
+    finally:
+        conn.close()
+
+
+def test_complete_rejected_gate_rewires_existing_children_to_verified_remediation(kanban_home):
+    """When a gate completes with ``approved=false`` and verified replacement
+    cards, existing downstream children (like docs) should automatically
+    gain those cards as additional parents so they don't unblock on the
+    rejected gate alone."""
+    conn = kb.connect()
+    try:
+        worker = kb.create_task(conn, title="worker", assignee="worker")
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer_task = kb.create_task(conn, title="review", assignee="reviewer", parents=[worker])
+        docs_task = kb.create_task(conn, title="docs", assignee="docs", parents=[reviewer_task])
+        remediation = kb.create_task(
+            conn,
+            title="fix",
+            assignee="worker-2",
+            created_by="reviewer",
+            parents=[worker],
+        )
+
+        ok = kb.complete_task(
+            conn,
+            reviewer_task,
+            summary="rejected; remediation spawned",
+            metadata={"approved": False},
+            created_cards=[remediation],
+        )
+        assert ok is True
+
+        # Docs keeps the reviewer parent for traceability, but must also wait for fix.
+        assert set(kb.parent_ids(conn, docs_task)) == {reviewer_task, remediation}
+        assert kb.get_task(conn, docs_task).status == "todo"
+
+        import json as _json
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+            (reviewer_task,),
+        ).fetchone()
+        payload = _json.loads(row["payload"])
+        assert payload.get("verified_cards") == [remediation]
+        assert payload.get("rewired_children") == [{"parent": remediation, "child": docs_task}]
+    finally:
+        conn.close()
+
+
+def test_complete_accepts_triage_task_for_operator_repair_completion(kanban_home):
+    """A task manually moved to triage after semantically completing should still
+    be completable by an operator so the board can record the final handoff."""
+    conn = kb.connect()
+    try:
+        worker = kb.create_task(conn, title="worker", assignee="worker")
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer_task = kb.create_task(conn, title="review", assignee="reviewer", parents=[worker])
+        remediation = kb.create_task(
+            conn,
+            title="fix",
+            assignee="worker-2",
+            created_by="reviewer",
+            parents=[worker],
+        )
+        assert kb.complete_task(
+            conn,
+            reviewer_task,
+            summary="rejected once",
+            metadata={"approved": False},
+            created_cards=[remediation],
+        ) is True
+
+        # Simulate dashboard/manual repair workflow: reopen to triage, then operator closes cleanly.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='triage', completed_at=NULL WHERE id=?",
+                (reviewer_task,),
+            )
+
+        assert kb.complete_task(
+            conn,
+            reviewer_task,
+            summary="rejected; remediation already spawned",
+            metadata={"approved": False, "operator_repair": True},
+            created_cards=[remediation],
+        ) is True
+        task = kb.get_task(conn, reviewer_task)
+        assert task is not None and task.status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_rejected_gate_does_not_rewire_created_children(kanban_home):
+    """Freshly spawned remediation/re-review children should not be rewritten
+    back onto themselves; only pre-existing downstream children are rewired."""
+    conn = kb.connect()
+    try:
+        worker = kb.create_task(conn, title="worker", assignee="worker")
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer_task = kb.create_task(conn, title="review", assignee="reviewer", parents=[worker])
+        docs_task = kb.create_task(conn, title="docs", assignee="docs", parents=[reviewer_task])
+        remediation = kb.create_task(
+            conn,
+            title="fix",
+            assignee="worker-2",
+            created_by="reviewer",
+            parents=[worker],
+        )
+        re_review = kb.create_task(
+            conn,
+            title="re-review",
+            assignee="reviewer",
+            created_by="reviewer",
+            parents=[remediation],
+        )
+
+        ok = kb.complete_task(
+            conn,
+            reviewer_task,
+            summary="rejected; remediation + re-review spawned",
+            metadata={"approved": False},
+            created_cards=[remediation, re_review],
+        )
+        assert ok is True
+
+        # Docs must wait for both remediation steps.
+        assert set(kb.parent_ids(conn, docs_task)) == {reviewer_task, remediation, re_review}
+        # Re-review keeps only its intended remediation parent.
+        assert set(kb.parent_ids(conn, re_review)) == {remediation}
+    finally:
+        conn.close()
+
+
+def test_create_task_blocks_second_reviewer_lineage_same_workspace(kanban_home):
+    conn = kb.connect()
+    try:
+        workspace = "/mnt/win-workspace/nebula-drift"
+        worker = kb.create_task(
+            conn,
+            title="worker",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=workspace,
+        )
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker],
+        )
+        with pytest.raises(ValueError, match="already has a reviewer lineage"):
+            kb.create_task(
+                conn,
+                title="duplicate review",
+                assignee="reviewer",
+                workspace_kind="dir",
+                workspace_path=workspace,
+                parents=[worker],
+            )
+        assert reviewer
+    finally:
+        conn.close()
+
+
+def test_create_task_blocks_reviewer_until_terminal_worker_finishes_same_workspace(kanban_home):
+    conn = kb.connect()
+    try:
+        workspace = "/mnt/win-workspace/nebula-drift"
+        worker_a = kb.create_task(
+            conn,
+            title="worker a",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=workspace,
+        )
+        assert kb.complete_task(conn, worker_a, summary="worker a done") is True
+        worker_b = kb.create_task(
+            conn,
+            title="worker b",
+            assignee="worker-2",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker_a],
+        )
+        with pytest.raises(ValueError, match="unfinished worker descendants already exist"):
+            kb.create_task(
+                conn,
+                title="review too early",
+                assignee="reviewer",
+                workspace_kind="dir",
+                workspace_path=workspace,
+                parents=[worker_a],
+            )
+        assert kb.complete_task(conn, worker_b, summary="worker b done") is True
+        reviewer = kb.create_task(
+            conn,
+            title="terminal review",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker_b],
+        )
+        assert reviewer
+    finally:
+        conn.close()
+
+
+def test_create_task_blocks_reviewer_parenting_to_reviewer_same_workspace(kanban_home):
+    conn = kb.connect()
+    try:
+        workspace = "/mnt/win-workspace/nebula-drift"
+        worker = kb.create_task(
+            conn,
+            title="worker",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=workspace,
+        )
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker],
+        )
+        with pytest.raises(ValueError, match="cannot parent to reviewer task"):
+            kb.create_task(
+                conn,
+                title="review loop",
+                assignee="reviewer",
+                workspace_kind="dir",
+                workspace_path=workspace,
+                parents=[reviewer],
+            )
+    finally:
+        conn.close()
+
+
+def test_create_task_blocks_worker_parenting_directly_to_reviewer_same_workspace(kanban_home):
+    conn = kb.connect()
+    try:
+        workspace = "/mnt/win-workspace/nebula-drift"
+        worker = kb.create_task(
+            conn,
+            title="worker",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=workspace,
+        )
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker],
+        )
+        with pytest.raises(ValueError, match="cannot parent directly to reviewer"):
+            kb.create_task(
+                conn,
+                title="bad remediation",
+                assignee="worker-2",
+                created_by="reviewer",
+                workspace_kind="dir",
+                workspace_path=workspace,
+                parents=[reviewer],
+            )
+    finally:
+        conn.close()
+
+
+def test_create_task_allows_reviewer_after_rejection_extends_worker_chain(kanban_home):
+    conn = kb.connect()
+    try:
+        workspace = "/mnt/win-workspace/nebula-drift"
+        worker = kb.create_task(
+            conn,
+            title="worker",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=workspace,
+        )
+        assert kb.complete_task(conn, worker, summary="worker done") is True
+        reviewer = kb.create_task(
+            conn,
+            title="review",
+            assignee="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker],
+        )
+        ok = kb.complete_task(
+            conn,
+            reviewer,
+            summary="rejected; remediation + re-review will follow",
+            metadata={"approved": False},
+        )
+        assert ok is True
+        remediation = kb.create_task(
+            conn,
+            title="fix",
+            assignee="worker-2",
+            created_by="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[worker],
+        )
+        assert kb.complete_task(conn, remediation, summary="fix done") is True
+        re_review = kb.create_task(
+            conn,
+            title="re-review",
+            assignee="reviewer",
+            created_by="reviewer",
+            workspace_kind="dir",
+            workspace_path=workspace,
+            parents=[remediation],
+        )
+        assert set(kb.parent_ids(conn, remediation)) == {worker}
+        assert set(kb.parent_ids(conn, re_review)) == {remediation}
     finally:
         conn.close()
 

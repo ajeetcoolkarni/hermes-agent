@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from tests.kanban_test_helpers import seed_test_profiles
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    seed_test_profiles(home)
     kb.init_db()
     return home
 
@@ -219,6 +221,21 @@ def test_patch_status_complete(client):
         if c["name"] == "done"
     )
     assert any(x["id"] == t["id"] for x in done["tasks"])
+
+
+def test_patch_status_complete_from_triage(client):
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "triage": True},
+    ).json()["task"]
+    assert t["status"] == "triage"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "done", "result": "repaired from triage"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "done"
 
 
 def test_patch_block_then_unblock(client):
@@ -760,7 +777,7 @@ def test_bulk_archive(client):
     assert b["id"] not in ids
 
 
-def test_bulk_reassign(client):
+def test_bulk_reassign(client, kanban_home):
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks",
@@ -1002,8 +1019,9 @@ def test_event_dict_includes_run_id(client):
 # Per-task force-loaded skills via REST
 # ---------------------------------------------------------------------------
 
-def test_create_task_with_skills_roundtrips(client):
+def test_create_task_with_skills_roundtrips(client, kanban_home):
     """POST /tasks accepts `skills: [...]`, GET /tasks/:id returns it."""
+    (kanban_home / "profiles" / "linguist").mkdir(parents=True, exist_ok=True)
     r = client.post(
         "/api/plugins/kanban/tasks",
         json={
@@ -1021,7 +1039,98 @@ def test_create_task_with_skills_roundtrips(client):
     assert got["task"]["skills"] == ["translation", "github-code-review"]
 
 
-def test_create_task_without_skills_defaults_to_empty_list(client):
+def test_create_task_with_structured_phase_metadata_roundtrips(client, kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Core integration",
+            "assignee": "worker",
+            "workspace_kind": "dir",
+            "workspace_path": "/tmp/project",
+            "phase_name": "core integration",
+            "phase_index": 1,
+            "phase_total": 3,
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["phase_name"] == "core integration"
+    assert task["phase_index"] == 1
+    assert task["phase_total"] == 3
+
+    got = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert got["task"]["phase_name"] == "core integration"
+    assert got["task"]["phase_index"] == 1
+    assert got["task"]["phase_total"] == 3
+
+
+def test_dashboard_create_rejects_same_workspace_sibling_without_parent(client, kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    (kanban_home / "profiles" / "reviewer").mkdir(parents=True, exist_ok=True)
+
+    first = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Phase A — implementation",
+            "assignee": "worker",
+            "workspace_kind": "dir",
+            "workspace_path": "/tmp/project",
+            "body": "This phase covers implementation only. PHASE BOUNDARY: review comes next.",
+        },
+    )
+    assert first.status_code == 200, first.text
+    first_id = first.json()["task"]["id"]
+
+    second = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Parallel review",
+            "assignee": "reviewer",
+            "workspace_kind": "dir",
+            "workspace_path": "/tmp/project",
+            "body": "Review in parallel.",
+        },
+    )
+    assert second.status_code == 400
+    detail = second.json()["detail"]
+    assert "PIPELINE GUARD — BLOCKED" in detail
+    assert first_id in detail
+
+
+def test_dashboard_create_allows_same_workspace_child_when_parented(client, kanban_home):
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    (kanban_home / "profiles" / "reviewer").mkdir(parents=True, exist_ok=True)
+
+    first = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Phase A — implementation",
+            "assignee": "worker",
+            "workspace_kind": "dir",
+            "workspace_path": "/tmp/project",
+            "body": "This phase covers implementation only. PHASE BOUNDARY: review comes next.",
+        },
+    )
+    assert first.status_code == 200, first.text
+    first_id = first.json()["task"]["id"]
+
+    second = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Sequential review",
+            "assignee": "reviewer",
+            "workspace_kind": "dir",
+            "workspace_path": "/tmp/project",
+            "parents": [first_id],
+            "body": "Review after implementation completes.",
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["task"]["workspace_path"] == "/tmp/project"
+
+
+def test_create_task_without_skills_defaults_to_empty_list(client, kanban_home):
     """_task_dict serializes Task.skills=None as [] so the drawer can
     always .length check without guarding against null."""
     r = client.post(
@@ -1059,7 +1168,7 @@ def test_create_task_includes_warning_when_no_dispatcher(client, monkeypatch):
     assert "gateway" in data["warning"].lower()
 
 
-def test_create_task_no_warning_when_dispatcher_up(client, monkeypatch):
+def test_create_task_no_warning_when_dispatcher_up(client, monkeypatch, kanban_home):
     """Dispatcher running -> no `warning` field in the response."""
     monkeypatch.setattr(
         "hermes_cli.kanban._check_dispatcher_presence",

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.kanban_test_helpers import seed_test_profiles
 
 
 @pytest.fixture
@@ -19,6 +20,7 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    seed_test_profiles(home)
     kb.init_db()
     return home
 
@@ -417,7 +419,12 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="for-terminal", assignee="orion-cc")
+        with kb.write_txn(conn):
+            t = kb._new_task_id()
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_at) VALUES (?, ?, ?, 'ready', 0)",
+                (t, "for-terminal", "orion-cc"),
+            )
         res = kb.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_nonspawnable
     assert t not in res.skipped_unassigned
@@ -430,9 +437,12 @@ def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeyp
     to silence the stuck-warn while terminals still have queued work."""
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
-    with kb.connect() as conn:
-        kb.create_task(conn, title="t1", assignee="orion-cc")
-        kb.create_task(conn, title="t2", assignee="orion-research")
+    with kb.connect() as conn, kb.write_txn(conn):
+        for assignee in ("orion-cc", "orion-research"):
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_at) VALUES (?, ?, ?, 'ready', 0)",
+                (kb._new_task_id(), assignee, assignee),
+            )
         assert kb.has_spawnable_ready(conn) is False
 
 
@@ -444,9 +454,15 @@ def test_has_spawnable_ready_true_when_real_profile_present(kanban_home, monkeyp
     monkeypatch.setattr(
         profiles, "profile_exists", lambda name: name == "daily"
     )
-    with kb.connect() as conn:
-        kb.create_task(conn, title="terminal-task", assignee="orion-cc")
-        kb.create_task(conn, title="hermes-task", assignee="daily")
+    with kb.connect() as conn, kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status, created_at) VALUES (?, ?, ?, 'ready', 0)",
+            (kb._new_task_id(), "terminal-task", "orion-cc"),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, assignee, status, created_at) VALUES (?, ?, ?, 'ready', 0)",
+            (kb._new_task_id(), "hermes-task", "daily"),
+        )
         assert kb.has_spawnable_ready(conn) is True
 
 

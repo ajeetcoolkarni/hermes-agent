@@ -47,6 +47,11 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from tools.terminal_command_guardrails import (
+    foreground_background_guidance as _foreground_background_guidance,
+    managed_background_conflict_guidance as _managed_background_conflict_guidance,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1537,94 +1542,6 @@ def _command_requires_pipe_stdin(command: str) -> bool:
         normalized.startswith("gh auth login")
         and "--with-token" in normalized
     )
-
-
-_SHELL_LEVEL_BACKGROUND_RE = re.compile(r"\b(?:nohup|disown|setsid)\b", re.IGNORECASE)
-_INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
-_TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
-_LONG_LIVED_FOREGROUND_PATTERNS = (
-    re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
-    re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE),
-    re.compile(r"\bnext\s+dev\b", re.IGNORECASE),
-    re.compile(r"\bvite(?:\s|$)", re.IGNORECASE),
-    re.compile(r"\bnodemon\b", re.IGNORECASE),
-    re.compile(r"\buvicorn\b", re.IGNORECASE),
-    re.compile(r"\bgunicorn\b", re.IGNORECASE),
-    re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
-)
-
-
-def _looks_like_help_or_version_command(command: str) -> bool:
-    """Return True for informational invocations that should never be blocked."""
-    normalized = " ".join(command.lower().split())
-    return (
-        " --help" in normalized
-        or normalized.endswith(" -h")
-        or " --version" in normalized
-        or normalized.endswith(" -v")
-    )
-
-
-def _foreground_background_guidance(command: str) -> str | None:
-    """Suggest background mode when a foreground command looks long-lived.
-
-    Prevents workflows that start a server/watch process and then stall before
-    follow-up checks or test commands run.
-    """
-    if _looks_like_help_or_version_command(command):
-        return None
-
-    if _SHELL_LEVEL_BACKGROUND_RE.search(command):
-        return (
-            "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
-            "Use terminal(background=true) so Hermes can track the process, then run "
-            "readiness checks and tests in separate commands."
-        )
-
-    if _INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command):
-        return (
-            "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
-            "processes, then run health checks and tests in follow-up terminal calls."
-        )
-
-    for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
-        if pattern.search(command):
-            return (
-                "This foreground command appears to start a long-lived server/watch process. "
-                "Run it with background=true, verify readiness (health endpoint/log signal), "
-                "then execute tests in a separate command."
-            )
-
-    return None
-
-
-def _managed_background_conflict_guidance(command: str) -> str | None:
-    """Reject shell-level backgrounding when Hermes already manages the process.
-
-    ``terminal(background=True)`` is the supported way to launch a tracked
-    long-lived process. If the command itself also uses ``&`` / ``nohup`` /
-    ``disown`` / ``setsid``, Hermes only tracks the wrapper shell while the real
-    server escapes as an orphan. That defeats lifecycle tracking/cleanup and can
-    poison later process or browser steps.
-    """
-    if _looks_like_help_or_version_command(command):
-        return None
-
-    if _SHELL_LEVEL_BACKGROUND_RE.search(command):
-        return (
-            "background=true already launches and tracks the process for you. "
-            "Remove shell-level background wrappers (nohup/disown/setsid) and pass "
-            "the long-lived command directly."
-        )
-
-    if _INLINE_BACKGROUND_AMP_RE.search(command) or _TRAILING_BACKGROUND_AMP_RE.search(command):
-        return (
-            "background=true already launches and tracks the process for you. "
-            "Remove '&' from the command and pass the server/watch command directly so Hermes "
-            "can manage its lifecycle, output, and cleanup."
-        )
-
-    return None
 
 
 def _resolve_notification_flag_conflict(

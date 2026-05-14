@@ -13,6 +13,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from tools.terminal_command_guardrails import looks_like_long_lived_launch
 from utils import safe_json_loads
 
 
@@ -76,6 +77,8 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    terminal_long_lived_warn_after: int = 2
+    terminal_long_lived_block_after: int = 3
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
@@ -119,6 +122,14 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            terminal_long_lived_warn_after=_positive_int(
+                warn_after.get("terminal_long_lived", data.get("terminal_long_lived_warn_after")),
+                defaults.terminal_long_lived_warn_after,
+            ),
+            terminal_long_lived_block_after=_positive_int(
+                hard_stop_after.get("terminal_long_lived", data.get("terminal_long_lived_block_after")),
+                defaults.terminal_long_lived_block_after,
             ),
         )
 
@@ -229,6 +240,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._terminal_long_lived_counts: dict[ToolCallSignature, int] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
 
     @property
@@ -237,6 +249,26 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+
+        if tool_name == "terminal" and _is_terminal_long_lived_repeat(args):
+            repeat_count = self._terminal_long_lived_counts.get(signature, 0)
+            if repeat_count >= self.config.terminal_long_lived_block_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="terminal_long_lived_repeat_block",
+                    message=(
+                        f"Blocked {tool_name}: this same long-lived launch command was already attempted "
+                        f"{repeat_count} times this turn. Stop reissuing the identical dev-server/watch "
+                        "command; if you need it, launch it once with background=true, then verify readiness "
+                        "with process(...) or a health check instead of launching it again."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -293,6 +325,23 @@ class ToolCallGuardrailController:
             failed, _ = classify_tool_failure(tool_name, result)
 
         if failed:
+            if tool_name == "terminal" and _is_terminal_long_lived_repeat(args):
+                repeat_count = self._terminal_long_lived_counts.get(signature, 0) + 1
+                self._terminal_long_lived_counts[signature] = repeat_count
+                if self.config.warnings_enabled and repeat_count >= self.config.terminal_long_lived_warn_after:
+                    return ToolGuardrailDecision(
+                        action="warn",
+                        code="terminal_long_lived_repeat_warning",
+                        message=(
+                            f"{tool_name} repeated the same long-lived launch command {repeat_count} times this turn. "
+                            "This usually means a dev-server loop. Launch it once with background=true, then switch "
+                            "to process(...) or health checks instead of re-running the same server command."
+                        ),
+                        tool_name=tool_name,
+                        count=repeat_count,
+                        signature=signature,
+                    )
+
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
@@ -346,6 +395,7 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+        self._terminal_long_lived_counts.pop(signature, None)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
@@ -395,7 +445,7 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
     """Append runtime guidance to the current tool result content."""
     if decision.action not in {"warn", "halt"} or not decision.message:
         return result
-    label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
+    label = "Tool loop hard stop" if decision.action in {"halt", "block"} else "Tool loop warning"
     suffix = (
         f"\n\n[{label}: "
         f"{decision.code}; count={decision.count}; {decision.message}]"
@@ -453,3 +503,12 @@ def _positive_int(value: Any, default: int) -> int:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _is_terminal_long_lived_repeat(args: Mapping[str, Any]) -> bool:
+    if not isinstance(args, Mapping):
+        return False
+    command = args.get("command")
+    if not isinstance(command, str):
+        return False
+    return looks_like_long_lived_launch(command)
