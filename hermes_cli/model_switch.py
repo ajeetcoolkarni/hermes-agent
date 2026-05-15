@@ -1216,6 +1216,16 @@ def list_authenticated_providers(
         # section 2 (HERMES_OVERLAYS) with proper auth store checking.
         if pconfig and pconfig.auth_type != "api_key":
             continue
+
+        # GitHub Copilot must be handled by the overlay pass below, not the
+        # generic models.dev built-in pass. The overlay path uses
+        # provider_model_ids("copilot"), which fetches the live account-specific
+        # Copilot catalog with a static curated fallback. If we emit Copilot here
+        # first, its non-empty stale curated list short-circuits the CLI /model
+        # picker and hides newer account-available models like gpt-5.5 /
+        # claude-opus-4.7.
+        if hermes_id == "copilot":
+            continue
         if pconfig and pconfig.api_key_env_vars:
             env_vars = list(pconfig.api_key_env_vars)
         else:
