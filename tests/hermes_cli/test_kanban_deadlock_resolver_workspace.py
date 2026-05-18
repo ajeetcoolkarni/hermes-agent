@@ -37,6 +37,7 @@ def _task(mod, **overrides):
         status="todo",
         assignee="worker",
         body="",
+        workspace_kind="scratch",
         workspace_path="",
         consecutive_failures=0,
         max_retries=None,
@@ -66,6 +67,7 @@ def test_reviewer_remediation_pipeline_preserves_source_workspace(resolver_modul
         assignee="reviewer",
         body="still broken",
         parents=["t_worker"],
+        workspace_kind="dir",
         workspace_path=workspace,
     )
     worker = _task(
@@ -73,6 +75,7 @@ def test_reviewer_remediation_pipeline_preserves_source_workspace(resolver_modul
         id="t_worker",
         assignee="worker",
         status="done",
+        workspace_kind="dir",
         workspace_path=workspace,
     )
 
@@ -129,6 +132,88 @@ def test_worker_rereview_pipeline_falls_back_to_scratch_without_source_workspace
     assert "/mnt/win-workspace/nebula-drift" not in create_cmd
 
 
+def test_reviewer_remediation_pipeline_recovers_real_workspace_from_dir_ancestor_when_current_task_is_scratch(resolver_module):
+    workspace = "/mnt/win-workspace/nebula-drift"
+    root_review = _task(
+        resolver_module,
+        id="t_root_review",
+        title="Initial strict review",
+        status="done",
+        assignee="reviewer",
+        workspace_kind="dir",
+        workspace_path=workspace,
+    )
+    remediation = _task(
+        resolver_module,
+        id="t_fix_1",
+        title="First remediation",
+        status="done",
+        assignee="worker-2",
+        parents=[root_review.id],
+        children=["t_rereview_1"],
+        workspace_kind="scratch",
+        workspace_path="/home/test/.hermes/kanban/workspaces/t_fix_1",
+    )
+    rereview = _task(
+        resolver_module,
+        id="t_rereview_1",
+        title="Follow-up review",
+        status="blocked",
+        assignee="reviewer",
+        parents=[remediation.id],
+        workspace_kind="scratch",
+        workspace_path="/home/test/.hermes/kanban/workspaces/t_rereview_1",
+    )
+    root_review.children = [remediation.id]
+
+    cmds = resolver_module.PatternReviewerBlockedNoRemediation()._create_pipeline(
+        rereview,
+        {
+            root_review.id: root_review,
+            remediation.id: remediation,
+            rereview.id: rereview,
+        },
+    )
+
+    create_cmds = [cmd for cmd in cmds if cmd.startswith("hermes kanban create ")]
+    expected = shlex.quote(f"dir:{workspace}")
+    assert len(create_cmds) == 2
+    assert all(f"--workspace {expected}" in cmd for cmd in create_cmds)
+
+
+def test_worker_rereview_pipeline_recovers_real_workspace_from_dir_ancestor_when_fix_task_is_scratch(resolver_module):
+    workspace = "/mnt/win-workspace/nebula-drift"
+    upstream_review = _task(
+        resolver_module,
+        id="t_upstream_review",
+        title="Review gate",
+        status="done",
+        assignee="reviewer",
+        workspace_kind="dir",
+        workspace_path=workspace,
+    )
+    fix_task = _task(
+        resolver_module,
+        id="t_fix",
+        title="Fix auth flow",
+        status="done",
+        assignee="worker-2",
+        parents=[upstream_review.id],
+        workspace_kind="scratch",
+        workspace_path="/home/test/.hermes/kanban/workspaces/t_fix",
+    )
+    upstream_review.children = [fix_task.id]
+
+    cmds = resolver_module.PatternWorkerFixCompletedNeedsRereview().resolve(
+        fix_task,
+        {upstream_review.id: upstream_review, fix_task.id: fix_task},
+    )
+
+    create_cmd = next(cmd for cmd in cmds if cmd.startswith("hermes kanban create "))
+    expected = shlex.quote(f"dir:{workspace}")
+    assert f"--workspace {expected}" in create_cmd
+
+
 def test_worker_rereview_detect_blocks_non_terminal_worker_with_worker_descendant(resolver_module):
     workspace = "/tmp/shared repo"
     worker_a = _task(
@@ -137,6 +222,7 @@ def test_worker_rereview_detect_blocks_non_terminal_worker_with_worker_descendan
         title="phase a",
         status="done",
         assignee="worker",
+        workspace_kind="dir",
         workspace_path=workspace,
         children=["t_worker_b"],
     )
@@ -146,6 +232,7 @@ def test_worker_rereview_detect_blocks_non_terminal_worker_with_worker_descendan
         title="phase b",
         status="ready",
         assignee="worker-2",
+        workspace_kind="dir",
         workspace_path=workspace,
         parents=["t_worker_a"],
     )
@@ -161,6 +248,7 @@ def test_worker_rereview_detect_blocks_when_active_reviewer_exists_in_lineage(re
         title="fix",
         status="done",
         assignee="worker-2",
+        workspace_kind="dir",
         workspace_path=workspace,
         children=["t_review"],
     )
@@ -170,6 +258,7 @@ def test_worker_rereview_detect_blocks_when_active_reviewer_exists_in_lineage(re
         title="review",
         status="ready",
         assignee="reviewer",
+        workspace_kind="dir",
         workspace_path=workspace,
         parents=["t_worker"],
     )
@@ -185,6 +274,7 @@ def test_worker_rereview_resolve_parents_reviewer_to_terminal_worker(resolver_mo
         title="Fix auth flow",
         status="done",
         assignee="worker-2",
+        workspace_kind="dir",
         workspace_path=workspace,
     )
 
