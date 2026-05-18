@@ -61,6 +61,7 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['models'],
     help: 'change or show model',
     name: 'model',
     run: (arg, ctx) => {

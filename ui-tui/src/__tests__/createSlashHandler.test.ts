@@ -57,6 +57,15 @@ describe('createSlashHandler', () => {
     })
   })
 
+  it('opens the same live model picker for /models alias', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/models')).toBe(true)
+    expect(getOverlayState().modelPicker).toBe(true)
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
   it('honors TUI picker session scope without adding --global', async () => {
     patchUiState({ sid: 'sid-abc' })
 

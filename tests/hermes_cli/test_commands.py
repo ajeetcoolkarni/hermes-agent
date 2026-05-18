@@ -108,6 +108,7 @@ class TestResolveCommand:
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
         assert resolve_command("tasks").name == "agents"
+        assert resolve_command("models").name == "model"
 
     def test_topic_is_gateway_command(self):
         topic = resolve_command("topic")
@@ -149,6 +150,7 @@ class TestDerivedDicts:
         assert "/exit" in COMMANDS
         assert "/reload_mcp" in COMMANDS
         assert "/gateway" in COMMANDS
+        assert "/models" in COMMANDS
 
     def test_commands_by_category_covers_all_categories(self):
         registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}
