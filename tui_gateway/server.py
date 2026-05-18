@@ -5158,30 +5158,46 @@ def _(rid, params: dict) -> dict:
 @method("model.options")
 def _(rid, params: dict) -> dict:
     try:
-        from hermes_cli.model_switch import list_authenticated_providers
-        from hermes_cli.models import CANONICAL_PROVIDERS, _PROVIDER_LABELS
+        from hermes_cli.config import get_compatible_custom_providers
+        from hermes_cli.model_switch import list_picker_providers
 
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
         cfg = _load_cfg()
-        current_provider = getattr(agent, "provider", "") or ""
+        model_cfg = cfg.get("model", {})
+        cfg_provider = (
+            str(model_cfg.get("provider") or "").strip()
+            if isinstance(model_cfg, dict)
+            else ""
+        )
+        cfg_base_url = (
+            str(model_cfg.get("base_url") or "").strip()
+            if isinstance(model_cfg, dict)
+            else ""
+        )
+        current_provider = getattr(agent, "provider", "") or cfg_provider
         current_model = getattr(agent, "model", "") or _resolve_model()
-        current_base_url = getattr(agent, "base_url", "") or ""
-        # list_authenticated_providers already populates each provider's
-        # "models" with the curated list (same source as `hermes model` and
-        # classic CLI's /model picker). Do NOT overwrite with live
-        # provider_model_ids() — that bypasses curation and pulls in
-        # non-agentic models (e.g. Nous /models returns ~400 IDs including
-        # TTS, embeddings, rerankers, image/video generators).
+        current_base_url = getattr(agent, "base_url", "") or cfg_base_url
+        # The TUI /model picker must show the providers that are actually
+        # configured/authenticated for this install, not the full canonical
+        # catalog.  ``list_picker_providers`` is the same provider/model source
+        # used by the platform interactive pickers: it starts from
+        # authenticated/configured providers and applies picker-safe live
+        # filtering where needed.  Do not append CANONICAL_PROVIDERS here — that
+        # turns /model into a setup catalog full of unrelated providers and is
+        # the root cause of the "random providers/models" picker.
         user_provs = (
             cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
         )
-        custom_provs = (
-            cfg.get("custom_providers")
-            if isinstance(cfg.get("custom_providers"), list)
-            else []
-        )
-        authenticated = list_authenticated_providers(
+        try:
+            custom_provs = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_provs = (
+                cfg.get("custom_providers")
+                if isinstance(cfg.get("custom_providers"), list)
+                else []
+            )
+        providers = list_picker_providers(
             current_provider=current_provider,
             current_base_url=current_base_url,
             current_model=current_model,
@@ -5189,59 +5205,13 @@ def _(rid, params: dict) -> dict:
             custom_providers=custom_provs,
             max_models=50,
         )
-
-        # Mark authenticated providers and build lookup by slug
-        authed_map: dict = {}
-        authed_extra: list = []  # user-defined/custom not in CANONICAL_PROVIDERS
-        canonical_slugs = {e.slug for e in CANONICAL_PROVIDERS}
-        for p in authenticated:
+        for p in providers:
             p["authenticated"] = True
-            authed_map[p["slug"]] = p
-            if p["slug"] not in canonical_slugs:
-                authed_extra.append(p)
-
-        # Build final list in CANONICAL_PROVIDERS order, merging auth data
-        from hermes_cli.auth import PROVIDER_REGISTRY as _auth_reg
-
-        ordered: list = []
-        for entry in CANONICAL_PROVIDERS:
-            if entry.slug in authed_map:
-                ordered.append(authed_map[entry.slug])
-            else:
-                pconfig = _auth_reg.get(entry.slug)
-                auth_type = pconfig.auth_type if pconfig else "api_key"
-                key_env = (
-                    pconfig.api_key_env_vars[0]
-                    if (pconfig and pconfig.api_key_env_vars)
-                    else ""
-                )
-                if auth_type == "api_key" and key_env:
-                    warning = f"paste {key_env} to activate"
-                else:
-                    warning = f"run `hermes model` to configure ({auth_type})"
-                ordered.append(
-                    {
-                        "slug": entry.slug,
-                        "name": _PROVIDER_LABELS.get(entry.slug, entry.label),
-                        "is_current": entry.slug == current_provider,
-                        "is_user_defined": False,
-                        "models": [],
-                        "total_models": 0,
-                        "source": "built-in",
-                        "authenticated": False,
-                        "auth_type": auth_type,
-                        "key_env": key_env,
-                        "warning": warning,
-                    }
-                )
-
-        # Append user-defined/custom providers not in canonical list
-        ordered.extend(authed_extra)
 
         return _ok(
             rid,
             {
-                "providers": ordered,
+                "providers": providers,
                 "model": current_model,
                 "provider": current_provider,
             },

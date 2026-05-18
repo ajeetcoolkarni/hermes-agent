@@ -2971,11 +2971,13 @@ _OLLAMA_CLOUD_CACHE_TTL = 3600  # 1 hour
 
 
 def _strip_ollama_cloud_suffix(model_id: str) -> str:
-    """Strip :cloud / -cloud suffixes that models.dev appends to Ollama Cloud IDs.
+    """Strip legacy Ollama Cloud suffixes from fallback catalog IDs.
 
-    The live API uses clean IDs (e.g. 'kimi-k2.6') while models.dev sometimes
-    returns them as 'kimi-k2.6:cloud'. Normalising before the dedup merge
-    prevents duplicate entries in the merged model list.
+    The live Ollama Cloud API exposes and accepts the plain IDs from
+    ``https://ollama.com/v1/models``.  Only models.dev fallback entries may
+    still carry Hermes's historical ``:cloud``/``-cloud`` suffix convention.
+    Do not apply this helper to live API results or the picker stops matching
+    the user's actual account catalog.
     """
     for suffix in (":cloud", "-cloud"):
         if model_id.endswith(suffix):
@@ -3069,7 +3071,9 @@ def fetch_ollama_cloud_models(
     except Exception:
         pass
 
-    # 4. Merge: live first, then models.dev additions (deduped, order-preserving)
+    # 4. Merge: live first, then models.dev additions (deduped, order-preserving).
+    # Preserve live IDs exactly as returned by Ollama.  Only normalize the
+    # models.dev fallback entries, which may still carry legacy suffixes.
     if live_models or mdev_models:
         seen: set[str] = set()
         merged: list[str] = []

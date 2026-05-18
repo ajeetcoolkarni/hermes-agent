@@ -3440,22 +3440,29 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_model_options_does_not_overwrite_curated_models(monkeypatch):
-    """The TUI model.options handler must surface the same curated model
-    list as `hermes model` and the classic CLI /model picker.
+def test_model_options_uses_picker_providers_only(monkeypatch):
+    """TUI /model must list configured/authenticated providers, not the full catalog.
 
-    Regression: earlier versions of this handler unconditionally replaced
-    each provider's curated ``models`` field with ``provider_model_ids()``
-    (live /models catalog).  That pulled in hundreds of non-agentic models
-    for providers like Nous whose /models endpoint returns image/video
-    generators, rerankers, embeddings, and TTS models alongside chat models.
+    Regression: the handler used to append every CANONICAL_PROVIDERS entry after
+    the real authenticated rows.  That made the TUI picker show dozens of
+    unrelated providers as if they were available.  The gateway must delegate to
+    list_picker_providers and return that exact configured/live picker source.
     """
-    curated_providers = [
+    picker_providers = [
         {
-            "slug": "nous",
-            "name": "Nous",
-            "models": ["moonshotai/kimi-k2.5", "anthropic/claude-opus-4.7"],
-            "total_models": 30,
+            "slug": "copilot",
+            "name": "GitHub Copilot",
+            "models": ["gpt-5.5", "claude-opus-4.7"],
+            "total_models": 2,
+            "source": "hermes",
+            "is_current": True,
+            "is_user_defined": False,
+        },
+        {
+            "slug": "ollama-cloud",
+            "name": "Ollama Cloud",
+            "models": ["deepseek-v4-pro", "gemma4:31b"],
+            "total_models": 2,
             "source": "built-in",
             "is_current": False,
             "is_user_defined": False,
@@ -3465,32 +3472,32 @@ def test_model_options_does_not_overwrite_curated_models(monkeypatch):
     monkeypatch.setattr(
         server,
         "_load_cfg",
-        lambda: {"providers": {}, "custom_providers": []},
+        lambda: {
+            "model": {"default": "gpt-5.5", "provider": "copilot"},
+            "providers": {"copilot": {"name": "GitHub Copilot"}},
+            "custom_providers": [],
+        },
     )
 
     with patch(
-        "hermes_cli.model_switch.list_authenticated_providers",
-        return_value=curated_providers,
+        "hermes_cli.model_switch.list_picker_providers",
+        return_value=picker_providers,
     ) as listing:
-        # If provider_model_ids gets called at all, the handler is still
-        # overwriting curated with live — that's the regression we're
-        # guarding against.
         with patch("hermes_cli.models.provider_model_ids") as live_fetch:
             resp = server._methods["model.options"](99, {"session_id": ""})
 
     assert "result" in resp, resp
     providers = resp["result"]["providers"]
-    nous = next((p for p in providers if p.get("slug") == "nous"), None)
-    assert nous is not None
-    assert nous["models"] == [
-        "moonshotai/kimi-k2.5",
-        "anthropic/claude-opus-4.7",
-    ]
-    assert nous["total_models"] == 30
-    # Handler must not consult the live catalog — curated is the truth.
+    assert [p["slug"] for p in providers] == ["copilot", "ollama-cloud"]
+    assert resp["result"]["provider"] == "copilot"
+    assert resp["result"]["model"] == "gpt-5.5"
+    assert all(p["authenticated"] is True for p in providers)
+    assert all("warning" not in p for p in providers)
+    # Handler must not consult raw provider_model_ids directly; the picker
+    # source owns provider-specific live filtering.
     live_fetch.assert_not_called()
-    # list_authenticated_providers is the single source.
-    assert listing.call_count == 1
+    listing.assert_called_once()
+    assert listing.call_args.kwargs["current_provider"] == "copilot"
 
 
 def test_model_options_propagates_list_exception(monkeypatch):
@@ -3502,7 +3509,7 @@ def test_model_options_propagates_list_exception(monkeypatch):
         lambda: {"providers": {}, "custom_providers": []},
     )
     with patch(
-        "hermes_cli.model_switch.list_authenticated_providers",
+        "hermes_cli.model_switch.list_picker_providers",
         side_effect=RuntimeError("catalog blew up"),
     ):
         resp = server._methods["model.options"](77, {"session_id": ""})
