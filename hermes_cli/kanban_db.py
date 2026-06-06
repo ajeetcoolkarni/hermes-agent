@@ -6514,9 +6514,9 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
-    # --- telemetry: why we skipped ---
-    result.skipped_workspace_busy = _skipped_ws
-    result.skipped_cap = _skipped_cap
+    # Note: result.skipped_workspace_busy and result.skipped_cap are populated
+    # in-loop above. No end-of-function reassignment needed —
+    # dataclass fields default to empty lists and accumulate via .append().
     return result
 
 
