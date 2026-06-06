@@ -2996,18 +2996,21 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant FROM tasks WHERE id = ?", (task_id,)
+            "SELECT id, status, tenant, workspace_kind, workspace_path FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if root_row is None:
             return None
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        parent_ws_kind = root_row["workspace_kind"] or "scratch"
+        parent_ws_path = root_row["workspace_path"] or None
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
         # promotes parent-free children to 'ready'.
+        # ROOT-CAUSE FIX: inherit workspace from parent task, never default to scratch.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -3016,13 +3019,16 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', 'scratch', ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    # Inherit parent workspace; fallback to scratch only if parent had none.
+                    parent_ws_kind,
+                    parent_ws_path,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -3221,6 +3227,36 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
+
+
+def _worker_terminal_timeout_env(
+    max_runtime_seconds: Optional[int],
+    current_timeout: Optional[str],
+) -> Optional[str]:
+    """Return a worker-scoped TERMINAL_TIMEOUT override, if needed.
+
+    Kanban's ``max_runtime_seconds`` bounds the whole worker attempt. The
+    terminal tool has its own default timeout via ``TERMINAL_TIMEOUT``; when
+    the worker runtime is longer, raise only the child process default so a
+    long command is not killed by the generic terminal default first.
+    """
+    if max_runtime_seconds is None:
+        return None
+    try:
+        runtime = int(max_runtime_seconds)
+    except (TypeError, ValueError):
+        return None
+    if runtime <= 0:
+        return None
+
+    desired = max(1, runtime - KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS)
+    try:
+        existing = int(str(current_timeout).strip()) if current_timeout else 0
+    except (TypeError, ValueError):
+        existing = 0
+    if existing >= desired:
+        return None
+    return str(desired)
 
 
 @dataclass
@@ -4331,6 +4367,122 @@ def _inject_prior_run_context(task, board=None):
             conn.close()
     except Exception:
         pass
+
+
+def _module_hermes_argv() -> list[str]:
+    """Return the interpreter-bound Hermes CLI invocation."""
+    # ``hermes_cli.main`` is the console-script target declared in
+    # pyproject.toml, NOT a top-level ``hermes`` package — there is no
+    # ``hermes`` package to import.
+    return [sys.executable, "-m", "hermes_cli.main"]
+
+
+def _absolute_hermes_path(path: str) -> str:
+    """Return an absolute filesystem path for a resolved Hermes shim."""
+    expanded = os.path.expanduser(path)
+    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
+
+
+def _looks_like_path(value: str) -> bool:
+    """Return true when a command override is an explicit path, not a name."""
+    expanded = os.path.expanduser(value)
+    return (
+        expanded.startswith("~")
+        or os.path.isabs(expanded)
+        or bool(os.path.dirname(expanded))
+        or "\\" in expanded
+        or bool(re.match(r"^[A-Za-z]:", expanded))
+    )
+
+
+def _is_windows_batch_shim(path: str) -> bool:
+    """Return true for Windows shell/batch shims that should not be argv[0]."""
+    return path.lower().endswith((".cmd", ".bat"))
+
+
+def _path_search_names(command: str) -> list[str]:
+    """Return executable names to try for an unqualified command."""
+    if not _IS_WINDOWS or os.path.splitext(command)[1]:
+        return [command]
+    raw = os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD"
+    exts = [ext for ext in raw.split(";") if ext]
+    return [command + ext for ext in exts]
+
+
+def _safe_which_no_cwd(command: str) -> Optional[str]:
+    """Resolve a bare command from PATH without implicit current-dir search.
+
+    ``shutil.which`` follows platform search behavior. On Windows that can
+    include the current directory before PATH for bare names, which is not a
+    safe dispatcher primitive. This resolver only considers explicit PATH
+    entries and skips empty / ``.`` entries.
+    """
+    path_env = os.environ.get("PATH", "")
+    for raw_dir in path_env.split(os.pathsep):
+        if not raw_dir or raw_dir == ".":
+            continue
+        directory = os.path.expanduser(raw_dir)
+        for name in _path_search_names(command):
+            candidate = os.path.join(directory, name)
+            if not os.path.isfile(candidate):
+                continue
+            if _IS_WINDOWS or os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def _hermes_path_argv(path: str) -> list[str]:
+    """Return argv for a resolved Hermes executable path.
+
+    Windows batch shims (`.cmd` / `.bat`) are not safe as argv[0] for
+    worker launches because the argument vector includes task-derived
+    values. Prefer the interpreter-bound module form whenever the resolved
+    executable is only a shell shim.
+    """
+    if _IS_WINDOWS and _is_windows_batch_shim(path):
+        return _module_hermes_argv()
+    return [_absolute_hermes_path(path)]
+
+
+def _resolve_hermes_argv() -> list[str]:
+    """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
+
+    Tries in order:
+
+    1. ``$HERMES_BIN`` — explicit operator override. Path-like values are
+       normalized to absolute paths; bare command names keep normal PATH
+       semantics and never prefer a same-directory file before ``PATH``.
+    2. ``shutil.which("hermes")`` — the console-script shim, normalized to
+       an absolute path. On Windows, ``which`` can return a relative
+       ``.\\hermes.CMD`` when the current directory is on ``PATH``; directly
+       launching batch shims is also unsafe with task-derived argv. The
+       dispatcher therefore falls back to the interpreter-bound module form
+       for implicit ``.cmd`` / ``.bat`` shims.
+    3. ``sys.executable -m hermes_cli.main`` — fallback for setups where
+       Hermes is launched from a venv and the ``hermes`` shim is not on
+       the dispatcher's ``$PATH`` (cron, systemd ``User=`` services,
+       launchd jobs, detached processes, etc.). Goes through the running
+       interpreter so the result is independent of ``$PATH``.
+
+    Mirrors ``gateway.run._resolve_hermes_bin`` for the same reason. Kept
+    local (not imported from gateway) because ``hermes_cli`` sits below
+    ``gateway`` in the dependency order.
+    """
+    import shutil
+
+    env_bin = os.environ.get("HERMES_BIN", "").strip()
+    if env_bin:
+        if _looks_like_path(env_bin):
+            return _hermes_path_argv(env_bin)
+        resolved_env_bin = _safe_which_no_cwd(env_bin)
+        if resolved_env_bin:
+            return _hermes_path_argv(resolved_env_bin)
+        return _module_hermes_argv()
+
+    hermes_bin = _safe_which_no_cwd("hermes") if _IS_WINDOWS else shutil.which("hermes")
+    if hermes_bin:
+        return _hermes_path_argv(hermes_bin)
+    return _module_hermes_argv()
 
 
 def _default_spawn(

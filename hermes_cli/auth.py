@@ -222,6 +222,16 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("LM_API_KEY",),
         base_url_env_var="LM_BASE_URL",
     ),
+    # Llama.cpp / llama-server local inference — user runs the server manually
+    # on localhost with no API key by default.
+    "llama": ProviderConfig(
+        id="llama",
+        name="Local (llama.cpp)",
+        auth_type="api_key",
+        inference_base_url="http://localhost:8001/v1",
+        api_key_env_vars=("LLAMA_API_KEY",),
+        base_url_env_var="LLAMA_BASE_URL",
+    ),
     "copilot": ProviderConfig(
         id="copilot",
         name="GitHub Copilot",

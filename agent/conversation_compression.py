@@ -157,14 +157,11 @@ def check_compression_model_feasibility(agent: Any) -> None:
             old_threshold = threshold
             new_threshold = aux_context
             agent.context_compressor.threshold_tokens = new_threshold
-            # Keep threshold_percent in sync so future main-model
-            # context_length changes (update_model) re-derive from a
-            # sensible number rather than the original too-high value.
+            # Do NOT overwrite threshold_percent — the user's configured
+            # value (e.g. 0.75) is the source of truth.  Only the live
+            # threshold_tokens is capped here for this session so the
+            # compression summariser can fit into the aux model.
             main_ctx = agent.context_compressor.context_length
-            if main_ctx:
-                agent.context_compressor.threshold_percent = (
-                    new_threshold / main_ctx
-                )
             safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
             # Build human-readable "model (provider)" labels for both
             # the main model and the compression model so users can

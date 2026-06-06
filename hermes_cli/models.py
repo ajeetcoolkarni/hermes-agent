@@ -36,6 +36,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("anthropic/claude-opus-4.6",              ""),
     ("anthropic/claude-sonnet-4.6",            ""),
     ("moonshotai/kimi-k2.6",                   "recommended"),
+    ("qwen/qwen3.7-max",                       ""),
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     ("qwen/qwen3.6-plus",                      ""),
     ("anthropic/claude-haiku-4.5",             ""),
@@ -166,6 +167,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "anthropic/claude-opus-4.6",
         "anthropic/claude-sonnet-4.6",
         "moonshotai/kimi-k2.6",
+        "qwen/qwen3.7-max",
         "qwen/qwen3.6-plus",
         "anthropic/claude-haiku-4.5",
         "openai/gpt-5.5",
@@ -436,6 +438,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "XiaomiMiMo/MiMo-V2-Flash",
         "moonshotai/Kimi-K2-Thinking",
         "moonshotai/Kimi-K2.6",
+    ],
+    # Llama.cpp local server — actual model ID comes from the running server's
+    # /v1/models endpoint; this entry exists only to satisfy catalog-lookup paths
+    # that expect _PROVIDER_MODELS to have an entry for every provider slug.
+    "llama": [
+        "Qwen3.6-27B-UD-Q5_K_XL.gguf",
     ],
     # AWS Bedrock — static fallback list used when dynamic discovery is
     # unavailable (no boto3, no credentials, or API error).  The agent
@@ -926,6 +934,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("openrouter",     "OpenRouter",               "OpenRouter (100+ models, pay-per-use)"),
     ProviderEntry("novita",         "NovitaAI",                 "NovitaAI (AI-native cloud: Model API, Agent Sandbox, GPU Cloud)"),
     ProviderEntry("lmstudio",       "LM Studio",                "LM Studio (local desktop app with built-in model server)"),
+    ProviderEntry("llama",           "Local (llama.cpp)",        "Local llama.cpp / llama-server (no API key — runs on localhost:8001)"),
     ProviderEntry("anthropic",      "Anthropic",                "Anthropic (Claude models — API key or Claude Code)"),
     ProviderEntry("openai-codex",   "OpenAI Codex",             "OpenAI Codex"),
     ProviderEntry("alibaba",        "Qwen Cloud",               "Qwen Cloud / DashScope Coding (Qwen + multi-provider)"),
@@ -1061,6 +1070,10 @@ _PROVIDER_ALIASES = {
     "lmstudio": "lmstudio",
     "lm-studio": "lmstudio",
     "lm_studio": "lmstudio",
+    "llama": "llama",
+    "llama.cpp": "llama",
+    "llama-cpp": "llama",
+    "llamacpp": "llama",
     "ollama": "custom",  # bare "ollama" = local; use "ollama-cloud" for cloud
     "ollama_cloud": "ollama-cloud",
 }
@@ -3392,6 +3405,45 @@ def validate_requested_model(
         return {
             "accepted": False, "persist": False, "recognized": False,
             "message": f"Model `{requested}` was not found in LM Studio's model listing.",
+        }
+
+    if normalized == "llama":
+        # Llama.cpp / llama-server — probe the /v1/models endpoint.
+        # api_key is often "not-needed" or empty for local servers.
+        probe = probe_api_models(api_key=api_key or "", base_url=base_url)
+        api_models = probe.get("models")
+        if api_models is None:
+            return {
+                "accepted": False, "persist": False, "recognized": False,
+                "message": (
+                    f"Could not reach the llama.cpp endpoint at `{probe.get('probed_url')}` "
+                    f"to validate `{requested}`. Make sure llama-server is running and the URL is correct."
+                ),
+            }
+        if not api_models:
+            return {
+                "accepted": False, "persist": False, "recognized": False,
+                "message": (
+                    f"Llama.cpp server is reachable but returned an empty model list. "
+                    f"Load `{requested}` in llama-server and try again."
+                ),
+            }
+        if requested_for_lookup in set(api_models):
+            return {"accepted": True, "persist": True, "recognized": True, "message": None}
+        # Auto-correct if the top match is very similar
+        auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
+        if auto:
+            return {
+                "accepted": True, "persist": True, "recognized": True,
+                "corrected_model": auto[0],
+                "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
+            }
+        return {
+            "accepted": False, "persist": False, "recognized": False,
+            "message": (
+                f"Model `{requested}` was not found in llama.cpp's model listing. "
+                f"Loaded models: {', '.join(api_models[:10])}{'...' if len(api_models) > 10 else ''}"
+            ),
         }
 
     if normalized == "custom" or normalized.startswith("custom:"):

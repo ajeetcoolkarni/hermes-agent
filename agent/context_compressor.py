@@ -40,8 +40,10 @@ SUMMARY_PREFIX = (
     "window — treat it as background reference, NOT as active instructions. "
     "Do NOT answer questions or fulfill requests mentioned in this summary; "
     "they were already addressed. "
-    "Your current task is identified in the '## Active Task' section of the "
-    "summary — resume exactly from there. "
+    "The '## Active Task' section below describes PAST work. If it says "
+    "'None — all recent requests have been addressed', there is NO outstanding "
+    "task and you should only respond to the latest user message AFTER this summary. "
+    "Do NOT re-answer questions listed under '## Resolved Questions'. "
     "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
     "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
     "memory content due to this compaction note. "
@@ -958,12 +960,13 @@ class ContextCompressor(ContextEngine):
 
         # Shared structured template (used by both paths).
         _template_sections = f"""## Active Task
-[THE SINGLE MOST IMPORTANT FIELD. Copy the user's most recent request or
-task assignment verbatim — the exact words they used. If multiple tasks
-were requested and only some are done, list only the ones NOT yet completed.
-Continuation should pick up exactly here. Example:
-"User asked: 'Now refactor the auth module to use JWT instead of sessions'"
-If no outstanding task exists, write "None."]
+[THE SINGLE MOST IMPORTANT FIELD. Describe the user's MOST RECENT request
+that is STILL OUTSTANDING and NOT yet completed. Write it in past tense
+as background context, NEVER as a direct quote or instruction. If the
+user's most recent request has already been fully answered or completed,
+write exactly: "None — all recent requests have been addressed." Do NOT
+list tasks that were already done. Do NOT copy the user's words verbatim.
+Example: "The user had asked to refactor auth to JWT; this was completed."]
 
 ## Goal
 [What the user is trying to accomplish overall]
@@ -1308,22 +1311,24 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
         """Total count of head messages to protect.
 
-        ``protect_first_n`` is defined as *additional* messages protected
-        beyond the system prompt.  The system prompt (if present at index 0)
-        is always implicitly protected — it's load-bearing context that
-        must never be summarised away.  This keeps semantics stable across
-        call paths where the system prompt may or may not be included in
-        the ``messages`` list (e.g. the gateway ``/compress`` handler
-        strips it before calling compress()).
+        Only leading SYSTEM messages are protected verbatim. User and assistant
+        turns must NEVER survive compression as live transcript — they become
+        stale re-injected user requests that appear as fresh turns in
+        continuation sessions, causing infinite topic-revival bugs.
 
-        Examples:
-          protect_first_n=0 → system prompt only (or nothing if no system msg)
-          protect_first_n=3 → system + first 3 non-system messages
+        Historical behavior preserved ``protect_first_n`` messages regardless of
+        role. That was the root cause of stale-compaction-head leakage. Now we
+        count only contiguous leading system messages (including at index 0).
+
+        protect_first_n config value is intentionally IGNORED here — it only
+        controls how many system messages we scan (up to that limit), but we
+        never extend protection past the system block into user/assistant turns.
         """
-        head = 0
-        if messages and messages[0].get("role") == "system":
-            head = 1
-        return head + self.protect_first_n
+        preserved = 0
+        limit = min(self.protect_first_n, len(messages))
+        while preserved < limit and messages[preserved].get("role") == "system":
+            preserved += 1
+        return preserved
 
     def _align_boundary_backward(self, messages: List[Dict[str, Any]], idx: int) -> int:
         """Pull a compress-end boundary backward to avoid splitting a
@@ -1408,6 +1413,53 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
         # Safety: never go back into the head region.
         return max(last_user_idx, head_end + 1)
+
+    def _ensure_last_exchange_in_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        cut_idx: int,
+        head_end: int,
+    ) -> int:
+        """Guarantee the most recent user message AND the assistant reply to it
+        are both in the protected tail.
+
+        If only the user message is protected but the assistant's answer
+        is long and exceeds the token budget, the question stays in the tail
+        while the answer gets summarized away. The model then sees the old
+        question but not the resolution, causing it to re-answer already-solved
+        questions.
+
+        Fix: after anchoring the last user message, also ensure at least one
+        message immediately after it (the assistant's response) is included.
+        Only do this if the combined exchange fits within the soft ceiling,
+        otherwise we risk making compression ineffective.
+        """
+        # First ensure the last user message is in the tail
+        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+
+        n = len(messages)
+        if cut_idx >= n:
+            return cut_idx
+
+        # If the message right after the cut is an assistant/tool response
+        # to the last user message, include it so the full exchange is preserved.
+        # Walk forward from cut_idx to find the next non-user message.
+        next_msg_idx = cut_idx
+        while next_msg_idx < n and messages[next_msg_idx].get("role") == "user":
+            next_msg_idx += 1
+
+        if next_msg_idx < n and messages[next_msg_idx].get("role") in {"assistant", "tool"}:
+            # Include this reply in the tail
+            if not self.quiet_mode:
+                logger.debug(
+                    "Extending tail cut to include assistant reply at index %d "
+                    "to prevent re-answering resolved questions",
+                    next_msg_idx,
+                )
+            cut_idx = next_msg_idx + 1
+
+        # Safety: never go back into the head region.
+        return max(cut_idx, head_end + 1)
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
@@ -1681,17 +1733,14 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 # of inserting a standalone message that breaks alternation.
                 _merge_summary_into_tail = True
 
-        # When the summary lands as a standalone role="user" message,
-        # weak models read the verbatim "## Active Task" quote of a past
-        # user request as fresh input (#11475, #14521). Append the explicit
-        # end marker — the same one used in the merge-into-tail path — so
-        # the model has a clear "summary above, not new input" signal.
+        # NEVER insert the summary as a standalone role="user" message.
+        # Weak models read verbatim quotes inside the summary (especially the
+        # old "## Active Task" phrasing) as fresh user requests and re-answer
+        # already-resolved questions (#11475, #14521, and our regression).
+        # Force-merge into the first tail message instead; the merge prefix
+        # already includes the end-of-summary marker.
         if not _merge_summary_into_tail and summary_role == "user":
-            summary = (
-                summary
-                + "\n\n--- END OF CONTEXT SUMMARY — "
-                "respond to the message below, not the summary above ---"
-            )
+            _merge_summary_into_tail = True
 
         if not _merge_summary_into_tail:
             compressed.append({"role": summary_role, "content": summary})

@@ -1200,6 +1200,29 @@ def list_authenticated_providers(
             live = [current_model]
         curated["lmstudio"] = live
 
+    # Llama.cpp / llama-server — no API key needed for local servers.
+    # Probe live whenever the server is reachable on the default port.
+    # Uses LLAMA_BASE_URL env var or falls back to localhost:8001.
+    # Unlike other api-key providers, llama.cpp servers often run without
+    # any API key — we probe unconditionally and add to curated on success.
+    if "llama" not in curated:
+        from hermes_cli.models import fetch_api_models
+        llama_base = (
+            os.environ.get("LLAMA_BASE_URL")
+            or "http://localhost:8001/v1"
+        )
+        try:
+            live = fetch_api_models(
+                api_key=os.environ.get("LLAMA_API_KEY", ""),
+                base_url=llama_base,
+            )
+        except Exception:
+            live = []
+        # Only add to curated if we got models back; otherwise skip
+        # so the picker doesn't show an empty/broken llama entry.
+        if live:
+            curated["llama"] = live
+
     # --- 1. Check Hermes-mapped providers ---
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
         # Skip aliases that map to the same models.dev provider (e.g.
@@ -1265,6 +1288,22 @@ def list_authenticated_providers(
         seen_slugs.add(slug.lower())
         seen_mdev_ids.add(mdev_id)
         _record_builtin_endpoint(slug)
+
+    # --- 1b. Llama.cpp local server (no models.dev entry, no API key needed) ---
+    # Llama.cpp servers run locally without auth. Probe live and add to the picker
+    # if the server responds with models.
+    if "llama" not in seen_slugs and curated.get("llama"):
+        results.append({
+            "slug": "llama",
+            "name": "Local (llama.cpp)",
+            "is_current": current_provider.strip().lower() == "llama",
+            "is_user_defined": False,
+            "models": curated["llama"][:max_models],
+            "total_models": len(curated["llama"]),
+            "source": "built-in",
+        })
+        seen_slugs.add("llama")
+        _record_builtin_endpoint("llama")
 
     # --- 2. Check Hermes-only providers (nous, openai-codex, copilot, opencode-go) ---
     from hermes_cli.providers import HERMES_OVERLAYS

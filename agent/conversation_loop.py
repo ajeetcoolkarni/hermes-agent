@@ -479,10 +479,16 @@ def run_conversation(
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
                 # Re-estimate after compression
+                # BUG-FIX: Don't include tool schemas in re-check. They are a
+                # fixed overhead (~20-30K tokens for 50+ tools) that was already
+                # counted in the initial trigger decision. Counting them again
+                # on every post-compression pass keeps the estimate above
+                # threshold even after the message portion has been significantly
+                # compressed, causing false multi-pass compaction loops.
                 _preflight_tokens = estimate_request_tokens_rough(
                     messages,
                     system_prompt=active_system_prompt or "",
-                    tools=agent.tools or None,
+                    tools=None,
                 )
                 if _preflight_tokens < agent.context_compressor.threshold_tokens:
                     break  # Under threshold

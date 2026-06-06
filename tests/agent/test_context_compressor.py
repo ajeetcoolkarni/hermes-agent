@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX, _content_text_for_contains
 
 
 @pytest.fixture()
@@ -1004,13 +1004,13 @@ class TestCompressWithClient:
             "call_123"
         ]
 
-    def test_user_role_summary_carries_end_marker(self):
-        """When the summary lands as standalone role='user' (e.g. head ends
-        with assistant/tool), the message body must include the explicit
-        '--- END OF CONTEXT SUMMARY ---' marker. Without it, weak models
-        read the verbatim past user request quoted in '## Active Task' as
-        fresh input (#11475, #14521).
-        """
+    def test_user_role_summary_merged_into_tail(self):
+        """When role alternation would force the summary as standalone
+        role='user', it must be merged into the first tail message instead.
+        Weak models read verbatim quotes inside a user-role summary as fresh
+        input, causing them to re-answer already-resolved questions (#11475,
+        #14521, and our regression).  Merging into the tail eliminates that
+        risk while still carrying the end-marker for clarity."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -1019,7 +1019,8 @@ class TestCompressWithClient:
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
         # head_last=assistant, tail_first=assistant (same shape as the
-        # existing consecutive-user test) → role resolves to "user".
+        # existing consecutive-user test) → role resolves to "user", but
+        # our fix forces merge-into-tail to avoid re-answering.
         msgs = [
             {"role": "user", "content": "msg 0"},
             {"role": "assistant", "content": "msg 1"},
@@ -1033,17 +1034,31 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
 
-        summary_msg = next(
-            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
-        )
-        assert summary_msg["role"] == "user"
-        assert "END OF CONTEXT SUMMARY" in summary_msg["content"]
-        assert summary_msg["content"].rstrip().endswith(
-            "respond to the message below, not the summary above ---"
-        )
+        # Summary MUST NOT be a standalone user message
+        standalone_user_summary = [
+            m for m in result
+            if m.get("role") == "user"
+            and (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(standalone_user_summary) == 0, \
+            "Summary was standalone user message — weak models will re-read it as fresh input"
+
+        # Summary SHOULD be merged into the first tail message (assistant)
+        merged_summary = [
+            m for m in result
+            if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(merged_summary) == 1, \
+            "Summary not found in merged form"
+        # The merged message carries the end marker
+        assert "END OF CONTEXT SUMMARY" in merged_summary[0]["content"]
+        # The original tail content is preserved (merged into first tail msg)
+        assert "msg 5" in merged_summary[0]["content"]
 
     def test_summary_role_avoids_consecutive_user_messages(self):
-        """Summary role should alternate with the last head message to avoid consecutive same-role messages."""
+        """When last head is 'assistant' and first tail is 'assistant',
+        role resolves to 'user' but our fix forces merge-into-tail to
+        prevent weak models from re-reading the summary as fresh input."""
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
@@ -1053,10 +1068,8 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
-        # Last head message (index 1) is "assistant" → summary should be "user".
-        # With min_tail=3, tail = last 3 messages (indices 5-7).
-        # head_last=assistant, tail_first=assistant → summary_role="user", no collision.
-        # Need 8 messages: min_for_compress = 2+3+1 = 6, must have > 6.
+        # Last head message (index 1) is "assistant" → summary would be "user",
+        # but it gets merged into the first tail message instead.
         msgs = [
             {"role": "user", "content": "msg 0"},
             {"role": "assistant", "content": "msg 1"},
@@ -1069,11 +1082,24 @@ class TestCompressWithClient:
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
-        summary_msg = [
-            m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+
+        # Summary must NOT be standalone user message
+        standalone_user = [
+            m for m in result
+            if m.get("role") == "user"
+            and (m.get("content") or "").startswith(SUMMARY_PREFIX)
         ]
-        assert len(summary_msg) == 1
-        assert summary_msg[0]["role"] == "user"
+        assert len(standalone_user) == 0, \
+            "Summary was standalone user message — weak models will re-read it as fresh input"
+
+        # Summary SHOULD be merged into the first tail message (assistant)
+        merged_summary = [
+            m for m in result
+            if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(merged_summary) == 1, "Summary not found in merged form"
+        assert merged_summary[0]["role"] == "assistant"
+        assert "msg 5" in merged_summary[0]["content"]
 
     def test_summary_role_avoids_consecutive_user_when_head_ends_with_user(self):
         """When last head message is 'user', summary must be 'assistant' to avoid two consecutive user messages."""
@@ -1266,8 +1292,11 @@ class TestCompressWithClient:
         assert "summary text" in first_tail[0]["content"]
 
     def test_no_collision_scenarios_still_work(self):
-        """Verify that the common no-collision cases (head=assistant/tail=assistant,
-        head=user/tail=user) still produce a standalone summary message."""
+        """Verify that when role alternation would produce 'user' but there
+        is no collision, the summary is still merged into the first tail
+        message rather than inserted as a standalone user role message.
+        This prevents weak models from re-reading summary content as fresh
+        user input."""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "summary text"
@@ -1275,7 +1304,8 @@ class TestCompressWithClient:
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
-        # Head=assistant, Tail=assistant → summary_role="user", no collision.
+        # Head=assistant, Tail=assistant → summary_role="user", no collision
+        # with neighbors, but our fix forces merge-into-tail anyway.
         # With min_tail=3, tail = last 3 messages (indices 5-7).
         # Need 8 messages: min_for_compress = 2+3+1 = 6, must have > 6.
         msgs = [
@@ -1290,9 +1320,25 @@ class TestCompressWithClient:
         ]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
             result = c.compress(msgs)
-        summary_msgs = [m for m in result if (m.get("content") or "").startswith(SUMMARY_PREFIX)]
-        assert len(summary_msgs) == 1, "should have a standalone summary message"
-        assert summary_msgs[0]["role"] == "user"
+
+        # Summary must NOT be standalone user message
+        standalone_user = [
+            m for m in result
+            if m.get("role") == "user"
+            and (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(standalone_user) == 0, \
+            "Summary was standalone user message — weak models will re-read it as fresh input"
+
+        # Summary SHOULD be merged into the first tail message (assistant)
+        merged_summary = [
+            m for m in result
+            if (m.get("content") or "").startswith(SUMMARY_PREFIX)
+        ]
+        assert len(merged_summary) == 1, "Summary not found in merged form"
+        assert merged_summary[0]["role"] == "assistant"
+        assert "msg 5" in merged_summary[0]["content"]
+        assert "summary text" in merged_summary[0]["content"]
 
     def test_summarization_does_not_start_tail_with_tool_outputs(self):
         mock_response = MagicMock()
@@ -1942,3 +1988,166 @@ class TestTruncateToolCallArgsJson:
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
         assert parsed["content"].endswith("...[truncated]")
+
+
+class TestEnsureLastExchangeInTail:
+    """Regression: _ensure_last_user_message_in_tail only protected the last
+    user message but not the assistant's answer.  If the answer was long
+    enough to exceed the soft token ceiling, the question remained in the
+    tail while the resolution got summarized away — causing the model to
+    re-answer already-solved questions."""
+
+    def _make_compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="test",
+                threshold_percent=0.5,   # low threshold so compression fires
+                protect_first_n=1,
+                protect_last_n=1,
+                quiet_mode=True,
+            )
+
+    def test_last_exchange_is_preserved(self):
+        """The last user message AND the assistant reply must both survive
+        in the tail after _find_tail_cut_by_tokens runs."""
+        c = self._make_compressor()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old question 1"},
+            {"role": "assistant", "content": "old answer 1"},
+            {"role": "user", "content": "old question 2"},
+            {"role": "assistant", "content": "old answer 2"},
+            {"role": "user", "content": "resolved question"},
+            {"role": "assistant", "content": "resolution " * 5000},  # long answer
+        ]
+        # Manually simulate boundary logic
+        head_end = c._protect_head_size(messages)
+        compress_start = c._align_boundary_forward(messages, head_end)
+        cut_idx = c._find_tail_cut_by_tokens(messages, compress_start)
+
+        tail = messages[cut_idx:]
+        assert any(m.get("content") == "resolved question" for m in tail), \
+            "Last user message was dropped from tail"
+        assert any("resolution " in (m.get("content") or "") for m in tail), \
+            "Assistant reply to last user message was dropped from tail"
+
+    def test_old_question_stays_in_summary(self):
+        """Older resolved questions (not the very last exchange) should land
+        in the summarized middle region."""
+        c = self._make_compressor()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "resolved question"},
+            {"role": "assistant", "content": "resolution " * 5000},
+            {"role": "user", "content": "new question"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        head_end = c._protect_head_size(messages)
+        compress_start = c._align_boundary_forward(messages, head_end)
+        cut_idx = c._find_tail_cut_by_tokens(messages, compress_start)
+
+        tail = messages[cut_idx:]
+        # The resolved Q+A should NOT be in the tail — it should be in the
+        # region that gets summarized
+        assert not any(m.get("content") == "resolved question" for m in tail), \
+            "Old resolved question leaked into tail"
+
+
+class TestSummaryNeverStandaloneUserRole:
+    """Regression: when role alternation forced the summary as a standalone
+    role='user' message, weak models treated verbatim quotes inside the
+    summary (especially the '## Active Task' phrasing) as fresh user
+    requests and re-answered already-resolved questions."""
+
+    def _make_compressor(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            return ContextCompressor(
+                model="test",
+                threshold_percent=0.5,
+                protect_first_n=1,
+                protect_last_n=1,
+                quiet_mode=True,
+            )
+
+    def test_summary_merged_when_role_would_be_user(self):
+        """When boundary alignment would force summary_role='user',
+        the summary must be merged into the first tail message instead."""
+        c = self._make_compressor()
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "q3"},
+            {"role": "assistant", "content": "a3"},
+        ]
+        result = c.compress(messages)
+        # There should be NO standalone message with role "user" that carries
+        # only the summary. The summary must be merged into an existing tail msg.
+        summary_standalone_user = [
+            m for m in result
+            if m.get("role") == "user"
+            and SUMMARY_PREFIX in _content_text_for_contains(m.get("content", ""))
+        ]
+        assert len(summary_standalone_user) == 0, \
+            "Summary was inserted as standalone user message — weak models will re-read it as fresh input"
+
+
+class TestActiveTaskWording:
+    """Regression: the '## Active Task' template told the compressor LLM to
+    copy the user's most recent request VERBATIM.  When that request was
+    already resolved, the model later saw the exact question text and
+    re-answered it."""
+
+    def test_active_task_prompt_forbids_verbatim(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "2+2 = 4"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        # The template must NOT instruct the summarizer to copy verbatim
+        # (negative instructions like "Do NOT copy verbatim" are OK).
+        _active_task_section_start = prompt.find("## Active Task")
+        _active_task_section = prompt[_active_task_section_start:_active_task_section_start + 800]
+        # The ## Active Task section should not have positive verbatim instructions
+        assert "verbatim" not in _active_task_section.lower() or "not" in _active_task_section.lower(), \
+            "Template still instructs verbatim copy in Active Task section"
+        assert "exact words" not in prompt.lower(), \
+            "Template still instructs exact-word copy"
+        # The template SHOULD instruct past tense and "NOT yet completed"
+        assert "past tense" in prompt.lower() or "not yet completed" in prompt.lower(), \
+            "Template should instruct summarizer to describe outstanding tasks, not quote them"
+
+    def test_active_task_prompt_forces_none_when_done(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "2+2 = 4"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        # Must tell summarizer to write "None — all recent requests have been addressed"
+        assert "None — all recent requests have been addressed" in prompt, \
+            "Template must force explicit 'None' when there are no outstanding tasks"
+
